@@ -1,0 +1,123 @@
+common:
+  action_dim: 14
+  state_dim: 14
+  num_video_frames: 4
+  video_height: 224
+  video_width: 224
+  global_downsample_rate: 5            # 50 fps  → 10 fps effective
+  video_action_freq_ratio: 2           # 4 frames × 2 = H=8 actions
+
+dataset:
+  type: "lerobot"
+  task_mode: "single"
+  task_name: null
+  max_episodes: null
+  image_aug: false
+  params:
+    repo_id: "lerobot/aloha_static_towel"   # full repo_id so lerobot version-check succeeds (needs HF_TOKEN)
+    root: "/home/ubuntu/Motus/data_lerobot/aloha_static_towel"
+    embodiment_type: "aloha_static_towel"  # per-joint min/max from THIS dataset (union of action+state, train split); built by data/utils/calc_lerobot_norm_stats.py
+    enable_t5_fallback: false          # using precomputed t5_embedding/
+    t5_folder_name: "t5_embedding"
+    t5_text_len: 512
+    # ---- Held-out val split (40 train / 10 val for aloha_static_towel) ----
+    # Episodes are deterministically shuffled with val_split_seed; the last
+    # num_val_episodes go to the val set. Setting num_val_episodes: 0 disables
+    # the split (legacy behavior, train==val).
+    num_val_episodes: 10
+    val_split_seed: 0
+    # ---- Offline VAE-latent cache ----
+    # Build with: data/lerobot/build_vae_cache_offline.py --config <this file>
+    # When the cache exists, the training step skips the (frozen) VAE forward
+    # (~25% of step time). Missing keys fall back to a live VAE encode, so this
+    # is safe to leave on even before the cache is built.
+    use_vae_cache: true
+    vae_cache_folder: "vae_latent_cache"
+    # ---- Offline VLM hidden-state cache ----
+    # Build with: data/lerobot/build_vlm_cache_offline.py --config <this file>
+    # When present, the training step runs only the trainable VLM adapter and skips
+    # the frozen Qwen3-VL forward (~11% of step time). Missing keys fall back to a
+    # live VLM forward, so this is safe to leave on before the cache is built.
+    use_vlm_cache: true
+    vlm_cache_folder: "vlm_hidden_cache"
+
+model:
+  wan:
+    config_path: "/home/ubuntu/Motus/pretrained_models/Wan2.2-TI2V-5B"
+    checkpoint_path: "/home/ubuntu/Motus/pretrained_models/Wan2.2-TI2V-5B"
+    vae_path: "/home/ubuntu/Motus/pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    precision: "bfloat16"
+    frozen: true                       # required for single-A100 fit
+  vlm:
+    checkpoint_path: "/home/ubuntu/Motus/pretrained_models/Qwen3-VL-2B-Instruct"
+    precision: "bfloat16"
+    frozen: true
+  action_expert:
+    hidden_size: 1024
+    ffn_dim_multiplier: 4
+    norm_eps: 1e-5
+  und_expert:
+    hidden_size: 512
+    ffn_dim_multiplier: 4
+    norm_eps: 1e-5
+    vlm:
+      input_dim: 2048
+      projector_type: "mlp3x_silu"
+  time_distribution:
+    timestep_sample_method: "logit_normal"
+    sigmoid_scale: 1.0
+    min_t: 0.0
+    max_t: 1.0
+  inference:
+    num_inference_timesteps: 10
+  loss_weights:
+    video_loss_weight: 1.0
+    action_loss_weight: 1.0
+  ema:
+    enabled: false
+    update_after_step: 0
+    inv_gamma: 1.0
+    power: 0.75
+    min_value: 0.0
+    max_value: 0.9999
+  world_model: true                    # ← world-model mode (action!=state on real data)
+  loss_term: focal_fm                  # 'fm' (default) | 'focal_fm' (residual-magnitude reweighted FM)
+  # WM warm-start: seed StateExpert from a trained ActionExpert (RoboTwin2, 14-DoF bimanual).
+  # Transfers blocks + time + registers + encoders 1:1; head left zero-init. Set null to disable.
+  warmup_action_expert_ckpt: "/home/ubuntu/Motus/pretrained_models/Motus_robotwin2/mp_rank_00_model_states.pt"
+  use_triton_kernels: true             # ← Triton fused AdaLN-LN kernel. Set false for eager A/B baseline.
+
+training:
+  batch_size: 32
+  max_steps: 6000
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  scheduler_type: "linear"
+  warmup_steps: 100
+  cycle_length: 3000
+  f_max: 0.99
+  f_min: 0.4
+  grad_clip_norm: 0.5
+  use_amp: true
+  find_unused_parameters: false
+
+system:
+  checkpoint_dir: "./checkpoints_lerobot"
+  log_level: "INFO"
+  log_interval: 1
+  save_interval: 300
+  val_interval: 50000
+  num_workers: 0                       # T5 fallback path is single-process-only;
+  pin_memory: false                    # we use precomputed cache so workers OK too,
+                                       # but stay safe.
+
+logging:
+  report_to: "wandb"
+  wandb_project: "motus"
+  tensorboard_log_dir: "tensorboard_logs"
+  run_name: "wm_aloha_towel"
+
+resume:
+  checkpoint_path: null
+finetune:
+  checkpoint_path: null

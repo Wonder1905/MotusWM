@@ -271,7 +271,24 @@ class UniDiffuserTrainer:
         """Single training step for UniDiffuser."""
         self.model.train()
         self.optimizer.zero_grad()
-        
+
+        # === A/B timing instrumentation ===
+        # CUDA events around fwd / bwd / opt — non-blocking, no sync per step.
+        # Periodically print rolling averages so the LN flag's effect is visible.
+        # Set MOTUS_STEP_TIMING=0 to disable.
+        _do_timing = os.environ.get("MOTUS_STEP_TIMING", "1") == "1"
+        if _do_timing:
+            if not hasattr(self, "_timing_buf"):
+                from collections import deque
+                self._timing_buf = {k: deque(maxlen=50) for k in ("fwd", "bwd", "opt", "total")}
+                self._timing_step = 0
+                self._timing_print_every = int(os.environ.get("MOTUS_STEP_TIMING_EVERY", "50"))
+            ev_t0 = torch.cuda.Event(enable_timing=True)
+            ev_fwd = torch.cuda.Event(enable_timing=True)
+            ev_bwd = torch.cuda.Event(enable_timing=True)
+            ev_opt = torch.cuda.Event(enable_timing=True)
+            ev_t0.record()
+
         first_frame = batch['first_frame'].to(self.device, dtype=self.dtype)          # [B, C, H, W]
         video_frames = batch['video_frames'].to(self.device, dtype=self.dtype)        # [B, num_video_frames, C, H, W]
         language_embeddings = batch['language_embedding']
@@ -281,13 +298,28 @@ class UniDiffuserTrainer:
         if state is not None:
             state = state.to(self.device, dtype=self.dtype)      # [B, state_dim]
         actions = batch['action_sequence'].to(self.device, dtype=self.dtype)  # [B, action_chunk_size, action_dim]
+        # World-model target (optional — ignored by the VLA path in training_step).
+        future_states = batch.get('future_states', None)
+        if future_states is not None:
+            future_states = future_states.to(self.device, dtype=self.dtype)
+        # Precomputed VAE latents (optional — present iff the VAE cache is enabled and hit).
+        clean_full_latent = batch.get('clean_full_latent', None)
+        if clean_full_latent is not None:
+            clean_full_latent = clean_full_latent.to(self.device, dtype=self.dtype)
+        condition_frame_latent = batch.get('condition_frame_latent', None)
+        if condition_frame_latent is not None:
+            condition_frame_latent = condition_frame_latent.to(self.device, dtype=self.dtype)
+        # Precomputed frozen-VLM hidden state (optional — present iff VLM cache enabled and hit).
+        vlm_hidden = batch.get('vlm_hidden', None)
+        if vlm_hidden is not None:
+            vlm_hidden = vlm_hidden.to(self.device, dtype=self.dtype)
         # Handle VLM inputs - it's a Dict[str, Tensor] from collate_fn
         vlm_inputs = batch['vlm_inputs']
         if vlm_inputs is not None:
             # Move all tensors in the VLM inputs dict to device
-            vlm_inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+            vlm_inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                          for k, v in vlm_inputs.items()}
-        
+
         # Forward pass through UniDiffuser
         # Handle DDP wrapper
         model = self.model.module if hasattr(self.model, 'module') else self.model
@@ -298,26 +330,64 @@ class UniDiffuserTrainer:
             actions=actions,
             language_embeddings=language_embeddings,  # For WAN cross attention
             vlm_inputs=vlm_inputs,  # Complete VLM inputs from dataset
+            future_states=future_states,  # None unless world_model is on
+            clean_full_latent=clean_full_latent,            # None unless VAE cache hit
+            condition_frame_latent=condition_frame_latent,  # None unless VAE cache hit
+            vlm_hidden=vlm_hidden,                          # None unless VLM cache hit
             return_dict=True
         )
-        
+
         total_loss = loss_dict['total_loss']
-        
+
+        if _do_timing:
+            ev_fwd.record()
+
         # Backward pass (using accelerator if available)
         if hasattr(self, 'accelerator') and self.accelerator is not None:
             self.accelerator.backward(total_loss)
         else:
             total_loss.backward()
-        
+
         # Gradient clipping
         grad_clip_norm = self.config.training.grad_clip_norm if hasattr(self.config.training, 'grad_clip_norm') else 1.0
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
-        
+
+        if _do_timing:
+            ev_bwd.record()
+
         # Optimizer step
         self.optimizer.step()
-        
+
         if self.scheduler:
             self.scheduler.step()
+
+        if _do_timing:
+            ev_opt.record()
+            # Defer the sync/elapsed-time call so we don't bottleneck the step.
+            # The events haven't fired yet — we record them now, query later.
+            self._timing_buf["__pending"] = self._timing_buf.get("__pending", [])
+            self._timing_buf["__pending"].append((ev_t0, ev_fwd, ev_bwd, ev_opt))
+            # Once we accumulate a few, drain and average.
+            self._timing_step += 1
+            if self._timing_step % self._timing_print_every == 0:
+                # Drain: this forces a sync, which we do deliberately every N steps.
+                torch.cuda.synchronize()
+                for (t0, f, b, o) in self._timing_buf["__pending"]:
+                    self._timing_buf["fwd"].append(t0.elapsed_time(f))
+                    self._timing_buf["bwd"].append(f.elapsed_time(b))
+                    self._timing_buf["opt"].append(b.elapsed_time(o))
+                    self._timing_buf["total"].append(t0.elapsed_time(o))
+                self._timing_buf["__pending"].clear()
+                from models.triton_kernels import get_use_triton_ln
+                flag_state = "ON" if get_use_triton_ln() else "OFF"
+                logger.info(
+                    f"[step-timing | triton_ln={flag_state}] "
+                    f"fwd={sum(self._timing_buf['fwd'])/len(self._timing_buf['fwd']):.1f}ms "
+                    f"bwd={sum(self._timing_buf['bwd'])/len(self._timing_buf['bwd']):.1f}ms "
+                    f"opt={sum(self._timing_buf['opt'])/len(self._timing_buf['opt']):.1f}ms "
+                    f"total={sum(self._timing_buf['total'])/len(self._timing_buf['total']):.1f}ms "
+                    f"(rolling avg over {len(self._timing_buf['total'])} steps)"
+                )
         
         # Convert to float for logging
         metrics = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
@@ -469,11 +539,22 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple:
         action_loss_weight=config.model.loss_weights.action_loss_weight,
         training_mode=getattr(config, 'training_mode', 'finetune'),
         load_pretrained_backbones=getattr(config.model, 'load_pretrained_backbones', None),
+        world_model=bool(getattr(config.model, 'world_model', False)),
+        loss_term=str(getattr(config.model, 'loss_term', 'fm') or 'fm'),
+        warmup_action_expert_ckpt=getattr(config.model, 'warmup_action_expert_ckpt', None),
+        use_triton_kernels=bool(getattr(config.model, 'use_triton_kernels', True)),
     )
     
     # Create model (Accelerator will handle device placement and DDP)
     model = Motus(model_config)
-    
+
+    # Optionally freeze the WAN backbone (e.g., single-GPU toy runs where 5B DiT
+    # optimizer states would not fit). Set `model.wan.frozen: true` in config.
+    if bool(getattr(getattr(config.model, 'wan', {}), 'frozen', False)):
+        for p in model.video_model.wan_model.parameters():
+            p.requires_grad = False
+        logger.info("WAN DiT parameters frozen via config.model.wan.frozen=true")
+
     # Optimizer - parameter groups for separate WAN (video model) learning rate
     base_lr = float(config.training.learning_rate)
     wan_lr = float(getattr(config.training, 'wan_learning_rate', base_lr))
