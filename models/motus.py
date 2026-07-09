@@ -2,6 +2,7 @@
 # Three-modal UniDiffuser: Video Model (WAN) + Action Expert + Understanding Expert
 # Implements MoT (Mixture of Tokens) architecture with unified attention
 
+import os
 import sys
 import json
 import torch
@@ -21,6 +22,10 @@ from transformers import Qwen3VLForConditionalGeneration, AutoConfig
 from .wan_model import WanVideoModel
 from .action_expert import ActionExpert, ActionExpertConfig
 from .und_expert import UndExpert, UndExpertConfig
+from .state_expert import StateExpert, StateExpertConfig
+from .action_conditioner import ActionConditioner, ActionConditionerConfig
+from .action_injector import ActionInjector, ActionInjectorConfig
+from .triton_kernels import fused_modulated_ln, set_use_triton_ln
 # Add Flow-Matching schedulers
 from wan.utils.fm import FlowMatchScheduler
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
@@ -79,6 +84,35 @@ class MotusConfig:
     # Control whether to load pretrained WAN/VLM backbones.
     # None = default behavior (load), False = skip loading (init from config only)
     load_pretrained_backbones: Optional[bool] = None
+
+    # World-model mode flag.
+    # False (default) → existing VLA pipeline: predict actions + video.
+    # True            → predict future_states + video; actions become clean input.
+    world_model: bool = False
+
+    # Use Triton kernels for fused ops where available (currently: AdaLN-modulated LN).
+    # Set to False for eager fallback — useful for A/B benchmarking and bisecting
+    # numerical issues. Env var MOTUS_TRITON_LN=0 also disables.
+    use_triton_kernels: bool = True
+
+    # State-loss reduction (world-model mode only):
+    #   'fm'        → standard per-element MSE on the velocity prediction (default).
+    #   'focal_fm'  → focal-style reweighting using the ground-truth tracking
+    #                 residual |s_t − a_t| as the per-timestep weight. Steers
+    #                 gradient toward contact / lag frames so the model cannot
+    #                 trivially "predict identity" on a near-tracking dataset.
+    #                 Requires action_dim == state_dim (same proprio space);
+    #                 silently falls back to 'fm' otherwise.
+    loss_term: str = 'fm'
+
+    # World-model warm-start (optional). Path to a Motus checkpoint
+    # (`mp_rank_00_model_states.pt`) whose trained `action_expert.*` weights are
+    # remapped into the freshly-built StateExpert: the 30 joint-attention blocks,
+    # time embedding/projection, registers, and both input encoders transfer 1:1
+    # (action↔state name swap). The decoder head is left zero-init (flow-matching
+    # safe start) and the deterministic pos_embedding is regenerated. No effect
+    # unless world_model=True. See `_warmup_state_expert_from_action_expert`.
+    warmup_action_expert_ckpt: Optional[str] = None
 
     def __post_init__(self):
         """Calculate derived parameters."""
@@ -191,7 +225,10 @@ class VideoModule(nn.Module):
         v_mod = video_adaln_modulation
 
         # WAN FFN with AdaLN (params 3,4,5 for FFN: α3, β3, γ3)
-        ffn_input = wan_layer.norm2(video_tokens).float() * (1 + v_mod[4].squeeze(2)) + v_mod[3].squeeze(2)
+        ffn_input = fused_modulated_ln(
+            video_tokens, v_mod[4].squeeze(2), v_mod[3].squeeze(2),
+            eps=wan_layer.norm2.eps,
+        )
         ffn_out = wan_layer.ffn(ffn_input)
 
         with torch.amp.autocast('cuda', dtype=torch.float32):
@@ -222,8 +259,14 @@ class VideoModule(nn.Module):
         a_mod = action_adaln_modulation
 
         # Pre-attn normalization with AdaLN
-        norm_video = wan_layer.norm1(video_tokens).float() * (1 + v_mod[1].squeeze(2)) + v_mod[0].squeeze(2)
-        norm_action = action_block.norm1(action_tokens) * (1 + a_mod[1].squeeze(2)) + a_mod[0].squeeze(2)
+        norm_video = fused_modulated_ln(
+            video_tokens, v_mod[1].squeeze(2), v_mod[0].squeeze(2),
+            eps=wan_layer.norm1.eps,
+        )
+        norm_action = fused_modulated_ln(
+            action_tokens, a_mod[1].squeeze(2), a_mod[0].squeeze(2),
+            eps=action_block.norm1.eps,
+        )
 
         # Get dimensions
         B, L_v, C = norm_video.shape
@@ -273,6 +316,86 @@ class VideoModule(nn.Module):
 
         return video_tokens, action_tokens, und_tokens
 
+    def process_joint_attention_wm(
+        self,
+        video_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
+        video_adaln_modulation: tuple,
+        state_adaln_modulation: tuple,
+        layer_idx: int,
+        state_block: nn.Module,
+        und_tokens: torch.Tensor,
+        und_block: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        World-model variant of `process_joint_attention`.
+        Identical scaffold (WAN self-attn as MoT), but reads/writes the
+        side-expert projections via `wan_state_*` attributes on `state_block`
+        (StateExpertBlock) instead of `wan_action_*`. Action-stream code is
+        replaced by state-stream code one-for-one; downstream callers swap in
+        state_tokens for action_tokens.
+        """
+        wan_layer = self.video_model.wan_model.blocks[layer_idx]
+
+        v_mod = video_adaln_modulation
+        s_mod = state_adaln_modulation
+
+        norm_video = fused_modulated_ln(
+            video_tokens, v_mod[1].squeeze(2), v_mod[0].squeeze(2),
+            eps=wan_layer.norm1.eps,
+        )
+        norm_state = fused_modulated_ln(
+            state_tokens, s_mod[1].squeeze(2), s_mod[0].squeeze(2),
+            eps=state_block.norm1.eps,
+        )
+
+        B, L_v, C = norm_video.shape
+        L_s = norm_state.shape[1]
+        n = self.video_model.wan_model.num_heads
+        d = C // n
+
+        # State heads → WAN head space (mirrors action path).
+        s_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_state, state_block.wan_state_qkv)
+        s_q_h, s_k_h, s_v_h = s_qkv[0], s_qkv[1], s_qkv[2]
+        s_q = state_block.wan_state_norm_q(s_q_h.flatten(-2)).view(B, L_s, n, d)
+        s_k = state_block.wan_state_norm_k(s_k_h.flatten(-2)).view(B, L_s, n, d)
+        s_v = s_v_h.view(B, L_s, n, d)
+
+        # Understanding expert (unchanged path).
+        norm_und = und_block.norm1(und_tokens)
+        L_u = norm_und.shape[1]
+        u_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_und, und_block.wan_und_qkv)
+        u_q_h, u_k_h, u_v_h = u_qkv[0], u_qkv[1], u_qkv[2]
+        u_q = und_block.wan_und_norm_q(u_q_h.flatten(-2)).view(B, L_u, n, d)
+        u_k = und_block.wan_und_norm_k(u_k_h.flatten(-2)).view(B, L_u, n, d)
+        u_v = u_v_h.view(B, L_u, n, d)
+
+        seq_lens = torch.full((B,), L_v + L_s + L_u, dtype=torch.long, device=self.device)
+        freqs = self.video_model.wan_model.freqs
+        if freqs.device != self.device:
+            freqs = freqs.to(self.device)
+
+        # self.grid_sizes was preallocated for training batch_size; slice/expand to
+        # match the actual batch at this call site (inference can use B≠train BS).
+        grid_sizes_b = self.grid_sizes[:B] if self.grid_sizes.shape[0] >= B else self.grid_sizes[:1].expand(B, -1)
+
+        # WAN self-attn is target-agnostic — it operates on (video, side_expert, und).
+        # We feed state-stream qkv into the slot that previously took action-stream qkv.
+        y, state_out_h, und_out_h = wan_layer.self_attn(
+            norm_video, seq_lens, grid_sizes_b, freqs,
+            action_q=s_q, action_k=s_k, action_v=s_v,
+            und_q=u_q, und_k=u_k, und_v=u_v
+        )
+
+        und_out = und_block.wan_und_o(und_out_h.flatten(2))
+        state_out = state_block.wan_state_o(state_out_h.flatten(2))
+
+        video_tokens = video_tokens + y * v_mod[2].squeeze(2)
+        state_tokens = state_tokens + state_out * s_mod[2].squeeze(2)
+        und_tokens = und_tokens + und_out
+
+        return video_tokens, state_tokens, und_tokens
+
 
 class UndModule(nn.Module):
     """Understanding module - handles VLM with understanding queries and Understanding Expert."""
@@ -293,7 +416,24 @@ class UndModule(nn.Module):
         self,
         vlm_inputs
     ) -> torch.Tensor:
-        """Extract understanding features from VLM last layer."""
+        """Extract understanding features: frozen VLM forward + trainable adapter."""
+        last_layer_features = self.extract_und_hidden(vlm_inputs)
+        # [B, seq_len, vlm_dim] -> [B, seq_len, und_dim]
+        return self.und_expert.vlm_adapter(last_layer_features)
+
+    def und_features_from_hidden(self, vlm_hidden: torch.Tensor) -> torch.Tensor:
+        """Apply ONLY the trainable adapter to a precomputed frozen-VLM hidden state.
+        Used by the VLM-hidden cache path — the (frozen, expensive) VLM forward is
+        skipped and only the adapter (which is trained) runs here."""
+        return self.und_expert.vlm_adapter(vlm_hidden.to(self.device, self.dtype))
+
+    def extract_und_hidden(
+        self,
+        vlm_inputs
+    ) -> torch.Tensor:
+        """Frozen VLM forward → last-layer hidden states [B, seq_len, vlm_dim].
+        This is the cacheable part (deterministic given image+text, no trainable
+        params). The trainable adapter is applied separately."""
         if isinstance(vlm_inputs, list):
             B = len(vlm_inputs)
         else:
@@ -323,13 +463,10 @@ class UndModule(nn.Module):
         with torch.no_grad():
             vlm_output = self.vlm_model.model.language_model(**vlm_kwargs)
 
-        # Extract last layer features directly
+        # Extract last layer features directly (pre-adapter; this is what gets cached).
         last_layer_features = vlm_output.hidden_states[-1]  # [B, seq_len, vlm_dim]
 
-        # [B, seq_len, vlm_dim] -> [B, seq_len, und_dim]
-        adapted_features = self.und_expert.vlm_adapter(last_layer_features)
-
-        return adapted_features
+        return last_layer_features
         
     def _process_vlm_inputs_to_tokens(self, vlm_inputs, B: int) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[list], torch.Tensor]:
         """Convert VLM inputs to tokens.
@@ -469,7 +606,10 @@ class ActionModule(nn.Module):
         a_mod = action_adaln_modulation
 
         # Apply FFN with AdaLN modulation (params 3,4,5 for FFN: α3, β3, γ3)
-        ffn_input = action_block.norm2(action_tokens).float() * (1 + a_mod[4].squeeze(2)) + a_mod[3].squeeze(2)
+        ffn_input = fused_modulated_ln(
+            action_tokens, a_mod[4].squeeze(2), a_mod[3].squeeze(2),
+            eps=action_block.norm2.eps,
+        )
         ffn_out = action_block.ffn(ffn_input)
         
         with torch.amp.autocast('cuda', dtype=torch.float32):
@@ -485,6 +625,12 @@ class Motus(nn.Module):
     def __init__(self, config: MotusConfig):
         super().__init__()
         self.config = config
+
+        # Apply Triton-kernels flag. Module-level state in models.triton_kernels;
+        # env var MOTUS_TRITON_LN sets the initial default, this config field
+        # overrides it. set_use_triton_ln() can flip it later for A/B bench.
+        set_use_triton_ln(getattr(config, "use_triton_kernels", True))
+        logger.info(f"Triton modulated-LN kernel: {'ON' if config.use_triton_kernels else 'OFF (eager fallback)'}")
 
         # Set unified data type for the model
         self.dtype = torch.bfloat16
@@ -604,10 +750,63 @@ class Motus(nn.Module):
         
         self.und_expert = UndExpert(und_config, wan_config, vlm_config)
 
+        # World-model mode: instantiate the additional modules.
+        # `action_expert` above is always built so existing checkpoints / state-dicts
+        # still load cleanly; in WM mode we just don't use it and freeze it below.
+        self.state_expert = None
+        self.action_conditioner = None
+        self.action_injector = None
+        if getattr(config, 'world_model', False):
+            _lt = getattr(config, 'loss_term', 'fm') or 'fm'
+            logger.info(
+                f"World-model mode ENABLED (loss_term='{_lt}') — instantiating StateExpert + ActionConditioner + ActionInjector"
+            )
+            state_config = StateExpertConfig(
+                dim=config.action_expert_dim,
+                ffn_dim=config.action_expert_dim * config.action_expert_ffn_dim_multiplier,
+                num_layers=config.num_layers,
+                state_dim=config.action_state_dim,
+                horizon=config.action_chunk_size,
+                video_feature_dim=wan_dim,
+                causal=False,
+                num_registers=4,
+                eps=config.action_expert_norm_eps,
+            )
+            self.state_expert = StateExpert(state_config, wan_config)
+            self.action_conditioner = ActionConditioner(ActionConditionerConfig(
+                action_dim=config.action_dim,
+                dim=config.action_expert_dim,
+                horizon=config.action_chunk_size,
+                mlp_depth=1,
+            ))
+            self.action_injector = ActionInjector(ActionInjectorConfig(
+                action_dim=config.action_expert_dim,
+                wan_dim=wan_dim,
+            ))
+            # In WM mode the original action_expert is dead weight.
+            # Freeze it so its params don't enter the optimizer and it doesn't
+            # affect grads. Keeping the module around preserves checkpoint compat.
+            for p in self.action_expert.parameters():
+                p.requires_grad = False
+
+            # Optional warm-start: seed the StateExpert from a trained ActionExpert.
+            warm_ckpt = getattr(config, 'warmup_action_expert_ckpt', None)
+            if warm_ckpt:
+                self._warmup_state_expert_from_action_expert(warm_ckpt)
+
         # Move models to device
         self.device = next(self.video_model.parameters()).device
         self.action_expert.to(device=self.device, dtype=self.dtype)
         self.und_expert.to(device=self.device, dtype=self.dtype)
+        if self.state_expert is not None:
+            self.state_expert.to(device=self.device, dtype=self.dtype)
+            # Time embeddings stay fp32 for numerical stability (mirrors action_expert).
+            self.state_expert.time_embedding.to(dtype=torch.float32)
+            self.state_expert.time_projection.to(dtype=torch.float32)
+        if self.action_conditioner is not None:
+            self.action_conditioner.to(device=self.device, dtype=self.dtype)
+        if self.action_injector is not None:
+            self.action_injector.to(device=self.device, dtype=self.dtype)
         
         # Set time embedding layers to float32 for numerical stability
         self.action_expert.time_embedding.to(dtype=torch.float32)
@@ -670,6 +869,73 @@ class Motus(nn.Module):
 
         # Log parameter counts
         self.log_parameter_counts()
+
+    def _warmup_state_expert_from_action_expert(self, ckpt_path: str) -> None:
+        """Seed the StateExpert from a trained ActionExpert checkpoint (WM warm-start).
+
+        Remaps `action_expert.*` -> StateExpert params:
+          - blocks / ffn / modulation / time_embedding / time_projection / registers: 1:1
+          - wan_action_*               -> wan_state_*
+          - input_encoder.state_encoder  -> current_state_encoder
+          - input_encoder.action_encoder -> future_state_encoder
+        Deliberately NOT transferred: the decoder head (kept zero-init for a
+        flow-matching safe start) and pos_embedding (deterministic, regenerated).
+        Refuses silent partial loads — any unmappable/shape-mismatched tensor raises.
+        """
+        if self.state_expert is None:
+            logger.warning("warmup_action_expert_ckpt set but StateExpert is None (world_model off?); skipping.")
+            return
+        if not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(f"warmup_action_expert_ckpt not found: {ckpt_path}")
+
+        logger.info(f"[WM warm-start] loading ActionExpert weights from {ckpt_path}")
+        sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if isinstance(sd, dict) and "module" in sd and isinstance(sd["module"], dict):
+            sd = sd["module"]
+
+        # Canonical action_expert.* prefix only (ignore action_module.* duplicates).
+        src = {k[len("action_expert."):]: v for k, v in sd.items() if k.startswith("action_expert.")}
+        if not src:
+            raise RuntimeError(f"No 'action_expert.*' keys in {ckpt_path}; not a Motus checkpoint?")
+
+        def _remap(k: str) -> str:
+            k = k.replace("wan_action_qkv", "wan_state_qkv").replace("wan_action_o", "wan_state_o")
+            k = k.replace("wan_action_norm_q", "wan_state_norm_q").replace("wan_action_norm_k", "wan_state_norm_k")
+            k = k.replace("input_encoder.state_encoder", "input_encoder.current_state_encoder")
+            k = k.replace("input_encoder.action_encoder", "input_encoder.future_state_encoder")
+            k = k.replace("decoder.action_head", "decoder.state_head")
+            return k
+
+        tgt = self.state_expert.state_dict()
+        new, skipped, bad = {}, [], []
+        for k, v in src.items():
+            rk = _remap(k)
+            if rk == "input_encoder.pos_embedding":
+                skipped.append(k); continue
+            if rk.startswith("decoder.state_head"):
+                skipped.append(k); continue              # keep flow-matching zero-init head
+            if rk not in tgt:
+                bad.append((k, "no target key")); continue
+            if tuple(tgt[rk].shape) != tuple(v.shape):
+                bad.append((k, f"shape {tuple(v.shape)} vs target {tuple(tgt[rk].shape)}")); continue
+            new[rk] = v
+
+        if bad:
+            for k, why in bad:
+                logger.error(f"[WM warm-start] cannot map {k}: {why}")
+            raise RuntimeError(
+                f"[WM warm-start] {len(bad)} action_expert tensors unmappable — refusing silent partial load.")
+
+        missing, unexpected = self.state_expert.load_state_dict(new, strict=False)
+        expected_missing = {k for k in tgt if k.startswith("decoder.state_head")}
+        unexpected_missing = [k for k in missing if k not in expected_missing]
+        if unexpected_missing or unexpected:
+            raise RuntimeError(
+                f"[WM warm-start] incomplete load — missing={unexpected_missing[:5]} unexpected={list(unexpected)[:5]}")
+
+        logger.info(
+            f"[WM warm-start] transferred {len(new)}/{len(tgt)} StateExpert tensors "
+            f"(left at init: {sorted(expected_missing)}; skipped {len(skipped)} = head+pos_embedding by design)")
 
     def log_parameter_counts(self):
         """Log detailed parameter counts for each component."""
@@ -768,24 +1034,48 @@ class Motus(nn.Module):
         actions: torch.Tensor = None,     # [B, chunk_size, action_dim] - actions
         language_embeddings: Optional[List[torch.Tensor]] = None,  # Pre-encoded T5 embeddings for WAN
         vlm_inputs: Optional[List] = None,  # Complete VLM inputs from dataset
+        future_states: Optional[torch.Tensor] = None,  # [B, H, state_dim] — required iff world_model=True
+        clean_full_latent: Optional[torch.Tensor] = None,        # [B, C', T', H', W'] — precomputed VAE latent (cache)
+        condition_frame_latent: Optional[torch.Tensor] = None,   # [B, C', 1,  H', W'] — precomputed VAE latent (cache)
+        vlm_hidden: Optional[torch.Tensor] = None,               # [B, seq_len, vlm_dim] — precomputed frozen-VLM hidden (cache)
         return_dict: bool = True
     ) -> Dict[str, torch.Tensor]:
         """
         UniDiffuser training step with three modalities.
-        
+
         Args:
             first_frame: First video frame for Teacher Forcing
             video_frames: Target video frames
             texts: Text instructions for VLM
             images: Optional images for VLM
             state: Initial robot state
-            actions: Target action sequence
+            actions: Target action sequence (or clean conditioning if world_model)
             language_embeddings: Pre-encoded T5 embeddings for WAN model
+            future_states: Future-state target (world_model mode only)
             return_dict: Whether to return detailed outputs
-            
+
         Returns:
             Dictionary containing losses and metrics
         """
+        # World-model mode dispatches to a parallel implementation; the existing
+        # VLA path is unchanged below.
+        if getattr(self.config, 'world_model', False):
+            if future_states is None:
+                raise ValueError("world_model=True requires `future_states` in the batch")
+            return self._training_step_world_model(
+                first_frame=first_frame,
+                video_frames=video_frames,
+                state=state,
+                actions=actions,
+                future_states=future_states,
+                language_embeddings=language_embeddings,
+                vlm_inputs=vlm_inputs,
+                clean_full_latent=clean_full_latent,
+                condition_frame_latent=condition_frame_latent,
+                vlm_hidden=vlm_hidden,
+                return_dict=return_dict,
+            )
+
         B = video_frames.shape[0]
 
         # 1. Video pipeline
@@ -903,6 +1193,221 @@ class Motus(nn.Module):
                 'action_timestep_mean': sigma_action.float().mean().item(),
             }
 
+    def _training_step_world_model(
+        self,
+        first_frame: torch.Tensor,
+        video_frames: torch.Tensor,
+        state: torch.Tensor,
+        actions: torch.Tensor,
+        future_states: torch.Tensor,
+        language_embeddings: Optional[List[torch.Tensor]],
+        vlm_inputs: Optional[List],
+        return_dict: bool,
+        clean_full_latent: Optional[torch.Tensor] = None,
+        condition_frame_latent: Optional[torch.Tensor] = None,
+        vlm_hidden: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        World-model training step.
+
+        Differences from the VLA path:
+          - `actions` is CLEAN conditioning (never noised) → encoded by ActionConditioner.
+          - `future_states` is the new denoising target (flow-matching MSE).
+          - Joint-attention scaffold runs with state_tokens in place of action_tokens
+            via `VideoModule.process_joint_attention_wm`.
+          - Loss = w_v · L_video + w_s · L_state. No L_action.
+
+        Action injection into WAN's video DiT is deferred to Phase 3 (additive injector);
+        for now WAN sees actions only through the state-stream joint attention, which is
+        enough to overfit one trajectory (sanity ladder step 2).
+        """
+        # 1. Video pipeline — identical to the VLA path. When precomputed VAE latents
+        # are supplied (offline cache), skip the VAE forward entirely; the latents are
+        # a deterministic function of the (fixed, un-augmented) frames so this is exact.
+        if clean_full_latent is not None and condition_frame_latent is not None:
+            B = clean_full_latent.shape[0]
+            clean_full_latent = clean_full_latent.to(self.device, self.dtype)
+            condition_frame_latent = condition_frame_latent.to(self.device, self.dtype)
+        else:
+            B = video_frames.shape[0]
+            first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)
+            video_normalized = (video_frames * 2.0 - 1.0).permute(0, 2, 1, 3, 4)
+            full_video = torch.cat([first_frame_norm, video_normalized], dim=2)
+
+            with torch.no_grad():
+                clean_full_latent = self.video_model.encode_video(full_video.to(self.dtype))
+                condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))
+
+        # Same τ for video and state (plan §9.1).
+        timestep_id = torch.randint(0, self.fm_train_scheduler.num_train_timesteps, (B,))
+        video_t_embed = self.fm_train_scheduler.timesteps[timestep_id].to(dtype=self.dtype, device=self.device)
+        sigma_v = self.fm_train_scheduler.sigmas[timestep_id].to(dtype=self.dtype, device=self.device).view(B, 1, 1, 1, 1)
+        video_noise = torch.randn_like(clean_full_latent, dtype=self.dtype)
+        noisy_video_latent = clean_full_latent * (1 - sigma_v) + video_noise * sigma_v
+        noisy_video_latent[:, :, 0:1] = condition_frame_latent
+        video_target = video_noise - clean_full_latent
+        video_target[:, :, 0:1] = 0
+
+        video_tokens = self.video_module.prepare_input(noisy_video_latent.to(self.dtype))
+
+        # 1b. Additive action injection into the WAN video stream.
+        # Computed below (after action_tokens_clean is built) and added once
+        # before the layer loop. Zero-initialized projector → no behavior change
+        # at step 0; gradients teach WAN to use this signal.
+
+        # 2. State pipeline — flow-matching noise on future_states (use same τ as video).
+        sigma_s = sigma_v.view(B, 1, 1)  # broadcast over [B, H, state_dim]
+        future_states_dt = future_states.to(self.dtype)
+        state_noise = torch.randn_like(future_states_dt)
+        noised_future_states = future_states_dt * (1 - sigma_s) + state_noise * sigma_s
+        state_target = state_noise - future_states_dt  # flow-matching velocity target
+
+        # 3. Action conditioning (clean).
+        action_tokens_clean = self.action_conditioner(actions.to(self.dtype))  # [B, H, dim]
+
+        # 3b. Inject clean action into WAN video stream (additive, once pre-loop).
+        # grid_sizes is [B, 3] = [lat_T, lat_H, lat_W] — same for every sample in the batch.
+        lat_T = int(self.grid_sizes[0, 0].item())
+        lat_H = int(self.grid_sizes[0, 1].item())
+        lat_W = int(self.grid_sizes[0, 2].item())
+        action_delta = self.action_injector(action_tokens_clean, lat_T, lat_H, lat_W)
+        video_tokens = video_tokens + action_delta.to(video_tokens.dtype)
+
+        # 4. State expert encode.
+        if self.state_expert.config.num_registers > 0 and self.state_expert.registers is not None:
+            registers = self.state_expert.registers.expand(B, -1, -1)
+        else:
+            registers = None
+        current_state_tokens = state.unsqueeze(1).to(self.dtype)  # [B, 1, state_dim]
+        state_tokens = self.state_expert.input_encoder(
+            current_state_tokens, noised_future_states, action_tokens_clean, registers
+        )
+
+        # 5. VLM / Und tokens. With a precomputed frozen-VLM hidden state (cache),
+        # skip the (frozen, expensive) VLM forward and run only the trainable adapter.
+        if vlm_hidden is not None:
+            und_tokens = self.und_module.und_features_from_hidden(vlm_hidden)
+        else:
+            und_tokens = self.und_module.extract_und_features(vlm_inputs)
+
+        # 6. Time embeddings.
+        video_head_time_emb, video_adaln_params = self.video_module.get_time_embedding(
+            video_t_embed, video_tokens.shape[1]
+        )
+        # Reuse the same time embedding head structure as the action expert, but driven
+        # off StateExpert's time_embedding/time_projection. Inline rather than via
+        # ActionModule so the side-expert wiring stays explicit.
+        state_t_embed = video_t_embed  # same τ
+        if state_t_embed.dim() == 1:
+            t_expanded = state_t_embed.unsqueeze(1).expand(state_t_embed.size(0), state_tokens.shape[1])
+        else:
+            t_expanded = state_t_embed
+        with torch.amp.autocast('cuda', dtype=torch.float32):
+            bt = t_expanded.size(0)
+            t_flat = t_expanded.flatten()
+            state_basic_emb = self.state_expert.time_embedding(
+                sinusoidal_embedding_1d(self.state_expert.freq_dim, t_flat)
+                .unflatten(0, (bt, state_tokens.shape[1]))
+                .float()
+            )
+            state_adaln_params = self.state_expert.time_projection(state_basic_emb).unflatten(
+                2, (6, self.state_expert.config.dim)
+            )
+
+        # 7. T5 preprocess.
+        processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
+
+        # 8. MoT forward.
+        with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+            for layer_idx in range(self.config.num_layers):
+                video_adaln_modulation = self.video_module.compute_adaln_modulation(video_adaln_params, layer_idx)
+                with torch.amp.autocast('cuda', dtype=torch.float32):
+                    state_modulation = (
+                        self.state_expert.blocks[layer_idx].modulation.unsqueeze(0)
+                        + state_adaln_params
+                    ).chunk(6, dim=2)
+
+                video_tokens, state_tokens, und_tokens = self.video_module.process_joint_attention_wm(
+                    video_tokens, state_tokens, video_adaln_modulation, state_modulation, layer_idx,
+                    self.state_expert.blocks[layer_idx],
+                    und_tokens, self.und_expert.blocks[layer_idx],
+                )
+
+                video_tokens = self.video_module.process_cross_attention(
+                    video_tokens, video_adaln_params, layer_idx, processed_t5_context
+                )
+
+                # WAN FFN.
+                video_tokens = self.video_module.process_ffn(video_tokens, video_adaln_modulation, layer_idx)
+
+                # State expert FFN (mirrors ActionModule.process_ffn but on state stream).
+                state_block = self.state_expert.blocks[layer_idx]
+                s_mod = state_modulation
+                ffn_in = fused_modulated_ln(
+                    state_tokens, s_mod[4].squeeze(2), s_mod[3].squeeze(2),
+                    eps=state_block.norm2.eps,
+                )
+                ffn_out = state_block.ffn(ffn_in)
+                with torch.amp.autocast('cuda', dtype=torch.float32):
+                    state_tokens = state_tokens + ffn_out * s_mod[5].squeeze(2)
+
+                # Und FFN.
+                und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
+
+            # 9. Heads + losses.
+            video_pred = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
+            state_pred_full = self.state_expert.decoder(state_tokens, state_basic_emb)
+            # Layout: [current_state_token, H future_state_tokens, num_registers]
+            up_len = state_pred_full.shape[1] - self.state_expert.config.num_registers
+            state_pred = state_pred_full[:, 1:up_len, :]  # [B, H, state_dim]
+
+            video_pred_masked = video_pred.clone()
+            video_pred_masked[:, :, 0:1] = 0
+            video_loss = torch.nn.functional.mse_loss(video_pred_masked, video_target, reduction='mean')
+
+            # Per-element FM velocity squared error — used both for the unweighted
+            # baseline and (optionally) for focal_fm.
+            state_err_sq = (state_pred - state_target).pow(2)             # [B, H, state_dim]
+            state_loss_unweighted = state_err_sq.mean()
+
+            loss_term = getattr(self.config, 'loss_term', 'fm') or 'fm'
+            if loss_term == 'focal_fm' and actions.shape[-1] == future_states_dt.shape[-1]:
+                # Data-side focal reweighting. The per-timestep weight is the
+                # ground-truth tracking residual |s_t − a_t| (both clean, both
+                # normalized to [0, 1] by the loader), aggregated across joints.
+                # This is model-independent (no positive feedback loop with the
+                # current error), works in raw FM space (no flow-matching math
+                # change — same v_target, same v_pred), and degenerates to FM
+                # when residuals are uniform.
+                with torch.no_grad():
+                    actions_aligned = actions.to(future_states_dt.dtype)
+                    residual = (future_states_dt - actions_aligned).abs()  # [B, H, S]
+                    w = residual.mean(dim=-1, keepdim=True)                # [B, H, 1]
+                    w = (w + 1e-3).pow(0.7)                                # focal exponent γ=0.7
+                    w = w / w.mean().clamp(min=1e-6)                       # normalize so batch-mean ≈ 1
+                state_loss = (w * state_err_sq).mean()
+            else:
+                state_loss = state_loss_unweighted
+
+        # Reuse the existing action_loss_weight slot for state to avoid plumbing
+        # another knob through the config yet.
+        total_loss = (
+            self.config.video_loss_weight * video_loss
+            + self.config.action_loss_weight * state_loss
+        )
+
+        if return_dict:
+            return {
+                'total_loss': total_loss,
+                'video_loss': video_loss,
+                # Keep `action_loss` key for logger compatibility; semantically it's state_loss here.
+                'action_loss': state_loss,
+                'state_loss': state_loss,
+                'state_loss_unweighted': state_loss_unweighted,  # for A/B monitoring
+                'video_timestep_mean': sigma_v.float().mean().item(),
+                'action_timestep_mean': sigma_v.float().mean().item(),
+            }
+
     def inference_step(
         self,
         first_frame: torch.Tensor,
@@ -913,7 +1418,7 @@ class Motus(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Joint inference for video and action prediction.
-        
+
         Args:
             first_frame: Initial frame [B, C, H, W]
             texts: Text instructions for VLM
@@ -921,7 +1426,7 @@ class Motus(nn.Module):
             state: Initial robot state [B, state_dim]
             num_inference_steps: Number of denoising steps
             language_embeddings: Pre-encoded T5 embeddings for WAN model
-            
+
         Returns:
             Tuple of (predicted_frames, predicted_actions)
         """
@@ -1026,6 +1531,182 @@ class Motus(nn.Module):
         predicted_actions = action_latent.float()  # [B, action_chunk_size, 14]
 
         return predicted_frames, predicted_actions
+
+    def inference_step_wm(
+        self,
+        first_frame: torch.Tensor,
+        state: torch.Tensor,
+        actions: torch.Tensor,
+        num_inference_steps: int = 50,
+        language_embeddings: Optional[List[torch.Tensor]] = None,
+        vlm_inputs: Optional[List] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        World-model inference: predict future video + future states given current
+        observation and a clean action chunk.
+
+        Inputs:
+            first_frame:          [B, C, H, W]
+            state (current qpos): [B, state_dim]
+            actions (clean):      [B, H, action_dim]
+            num_inference_steps:  Euler steps (mirrors VLA inference_step's loop)
+            language_embeddings:  pre-encoded T5
+            vlm_inputs:           VLM dict
+
+        Returns:
+            (predicted_frames, predicted_states)
+                predicted_frames: [B, num_video_frames, C, H, W] in [0, 1]
+                predicted_states: [B, H, state_dim]
+        """
+        if not getattr(self.config, 'world_model', False):
+            raise RuntimeError("inference_step_wm called but model.config.world_model=False")
+        if self.state_expert is None or self.action_conditioner is None or self.action_injector is None:
+            raise RuntimeError("WM modules not instantiated (state_expert/action_conditioner/action_injector)")
+
+        B = first_frame.shape[0]
+
+        language_embeddings = [emb.to(self.device).to(self.dtype) for emb in language_embeddings]
+        state = state.to(self.device).to(self.dtype)
+        first_frame = first_frame.to(self.device).to(self.dtype)
+        actions = actions.to(self.device).to(self.dtype)
+
+        # 1. Encode condition frame for Teacher Forcing on the first latent frame.
+        first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)
+        with torch.no_grad():
+            condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))
+
+        # 2. Initialize video + state latents from noise.
+        # VAE latent grid (pre-WAN-patchify):
+        _, C_latent, _, H_vae, W_vae = condition_frame_latent.shape
+        num_total_latent_frames = 1 + self.config.num_video_frames // 4
+        video_latent = torch.randn(
+            (B, C_latent, num_total_latent_frames, H_vae, W_vae), device=self.device, dtype=self.dtype
+        )
+        video_latent[:, :, 0:1] = condition_frame_latent
+
+        # WAN tokenized grid (post-patch_embedding) — used by the action injector
+        # which must produce one delta per VIDEO TOKEN, not per VAE pixel.
+        # self.grid_sizes was precomputed with video_height // 32, which already
+        # bakes in the extra ×2 patchify.
+        lat_T = int(self.grid_sizes[0, 0].item())
+        lat_H = int(self.grid_sizes[0, 1].item())
+        lat_W = int(self.grid_sizes[0, 2].item())
+
+        H = self.config.action_chunk_size
+        S = self.config.action_state_dim
+        state_latent = torch.randn((B, H, S), device=self.device, dtype=self.dtype)
+
+        # 3. Clean action conditioning (computed once — never noised).
+        action_tokens_clean = self.action_conditioner(actions)  # [B, H, dim]
+
+        # 4. Static und/T5 context (re-extracted per step like the VLA path).
+        processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
+
+        # 5. Linear-schedule Euler denoising (mirrors the VLA inference_step structure).
+        timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=self.dtype)
+        for i in range(num_inference_steps):
+            t = timesteps[i]
+            t_next = timesteps[i + 1]
+            dt = t_next - t
+            video_t_scaled = (t * 1000).expand(B).to(self.dtype)
+            state_t_scaled = (t * 1000).expand(B).to(self.dtype)
+
+            # Tokens
+            video_tokens = self.video_module.prepare_input(video_latent.to(self.dtype))
+            # Inject clean actions into the video stream (Phase 3 additive path).
+            action_delta = self.action_injector(action_tokens_clean, lat_T, lat_H, lat_W)
+            video_tokens = video_tokens + action_delta.to(video_tokens.dtype)
+
+            # State expert input — mirrors WM training step.
+            current_state_tokens = state.unsqueeze(1)  # [B, 1, state_dim]
+            if self.state_expert.config.num_registers > 0 and self.state_expert.registers is not None:
+                registers = self.state_expert.registers.expand(B, -1, -1)
+            else:
+                registers = None
+            state_tokens = self.state_expert.input_encoder(
+                current_state_tokens, state_latent, action_tokens_clean, registers
+            )
+
+            und_tokens = self.und_module.extract_und_features(vlm_inputs)
+
+            with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+                # Time embeddings — video uses VideoModule's path; state uses StateExpert's own time embedding.
+                video_head_time_emb, video_adaln_params = self.video_module.get_time_embedding(
+                    video_t_scaled, video_tokens.shape[1]
+                )
+                # Build state time embeddings inline (mirrors the WM training step).
+                seq_len_state = state_tokens.shape[1]
+                if state_t_scaled.dim() == 1:
+                    t_expanded = state_t_scaled.unsqueeze(1).expand(B, seq_len_state)
+                else:
+                    t_expanded = state_t_scaled
+                with torch.amp.autocast('cuda', dtype=torch.float32):
+                    bt = t_expanded.size(0)
+                    t_flat = t_expanded.flatten()
+                    state_basic_emb = self.state_expert.time_embedding(
+                        sinusoidal_embedding_1d(self.state_expert.freq_dim, t_flat)
+                        .unflatten(0, (bt, seq_len_state))
+                        .float()
+                    )
+                    state_adaln_params = self.state_expert.time_projection(state_basic_emb).unflatten(
+                        2, (6, self.state_expert.config.dim)
+                    )
+
+                # Layer loop — joint attention via the WM scaffold.
+                for layer_idx in range(self.config.num_layers):
+                    video_adaln_modulation = self.video_module.compute_adaln_modulation(video_adaln_params, layer_idx)
+                    with torch.amp.autocast('cuda', dtype=torch.float32):
+                        state_modulation = (
+                            self.state_expert.blocks[layer_idx].modulation.unsqueeze(0)
+                            + state_adaln_params
+                        ).chunk(6, dim=2)
+
+                    video_tokens, state_tokens, und_tokens = self.video_module.process_joint_attention_wm(
+                        video_tokens, state_tokens, video_adaln_modulation, state_modulation, layer_idx,
+                        self.state_expert.blocks[layer_idx],
+                        und_tokens, self.und_expert.blocks[layer_idx],
+                    )
+
+                    video_tokens = self.video_module.process_cross_attention(
+                        video_tokens, video_adaln_params, layer_idx, processed_t5_context
+                    )
+
+                    video_tokens = self.video_module.process_ffn(video_tokens, video_adaln_modulation, layer_idx)
+
+                    # State expert FFN (mirrors WM training step).
+                    state_block = self.state_expert.blocks[layer_idx]
+                    s_mod = state_modulation
+                    ffn_in = fused_modulated_ln(
+                        state_tokens, s_mod[4].squeeze(2), s_mod[3].squeeze(2),
+                        eps=state_block.norm2.eps,
+                    )
+                    ffn_out = state_block.ffn(ffn_in)
+                    with torch.amp.autocast('cuda', dtype=torch.float32):
+                        state_tokens = state_tokens + ffn_out * s_mod[5].squeeze(2)
+
+                    und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
+
+                # Heads — velocities.
+                video_velocity = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
+                state_velocity_full = self.state_expert.decoder(state_tokens, state_basic_emb)
+                up_len = state_velocity_full.shape[1] - self.state_expert.config.num_registers
+                state_velocity = state_velocity_full[:, 1:up_len, :]  # [B, H, state_dim]
+
+                # Euler step
+                video_latent = video_latent + video_velocity * dt
+                state_latent = state_latent + state_velocity * dt
+                # Teacher Forcing on the first latent frame
+                video_latent[:, :, 0:1] = condition_frame_latent
+
+        # 6. Decode video latents → pixel space.
+        with torch.no_grad():
+            decoded_frames = self.video_model.decode_video(video_latent)
+            predicted_frames = decoded_frames[:, :, 1:]                # skip the condition frame
+            predicted_frames = (predicted_frames + 1.0) / 2.0
+            predicted_frames = torch.clamp(predicted_frames, 0, 1).float()
+
+        predicted_states = state_latent.float()
+        return predicted_frames, predicted_states
 
     # Alternative inference (DPM++ solver)
     '''
