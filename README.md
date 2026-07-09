@@ -175,6 +175,34 @@ The six-layer data pyramid is shown in the figure here:
 - [RoboTwin Dataset Converter](data/robotwin2/robotwin_data_convert/README.md)
 - [Multi-Camera Concatenation](data/utils/multi_camera_concat.py)
 
+### World-Model Training (single GPU)
+
+Train in world-model mode (clean actions in → future states + video out) on a LeRobot dataset:
+
+```bash
+torchrun --nnodes=1 --nproc_per_node=1 --node_rank=0 \
+    --master_addr=127.0.0.1 --master_port=29520 \
+    train/train.py \
+    --deepspeed configs/zero1.json \
+    --config configs/_wm_aloha_towel.yaml \
+    --run_name wm_aloha_towel_focal \
+    --report_to wandb
+```
+
+**(Optional) Precompute frozen-encoder caches for ~1.3–1.5× faster steps.**
+The WAN VAE and Qwen3-VL forwards are frozen and depend only on the (fixed) input
+frames, so their outputs can be cached offline once and reused every step. Build them
+before training (one-time, ~15 min each); `use_vae_cache` / `use_vlm_cache` are already
+enabled in `configs/_wm_aloha_towel.yaml`, and the loader falls back to live compute for
+any missing key, so this is safe to skip.
+
+```bash
+# VAE latents  → data_lerobot/<dataset>/vae_latent_cache/   (~1.3 GB)
+python data/lerobot/build_vae_cache_offline.py --config configs/_wm_aloha_towel.yaml
+# VLM hidden states → data_lerobot/<dataset>/vlm_hidden_cache/   (~6.5 GB)
+python data/lerobot/build_vlm_cache_offline.py --config configs/_wm_aloha_towel.yaml
+```
+
 ## Troubleshooting
 
 **📖 Detailed guides:**

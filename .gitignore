@@ -1,5 +1,14 @@
 .vscode
 
+# Pretrained model checkpoints (weights, tokenizers, configs — fetched via hf download)
+pretrained_models/
+
+# External reference repos cloned alongside (not part of this project)
+nano-world-model/
+
+# Claude Code scratch
+.claude/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -231,3 +240,6 @@ datasets/*
 scripts_new/
 scripts/run_local.sh
 scripts/manual_multi_node_srun.sh
+*checkpoints*
+*data_demo*
+*data_lerobot*
