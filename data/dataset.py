@@ -312,7 +312,23 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
     action_sequences = torch.stack([sample['action_sequence'] for sample in batch])
     has_initial_state = all(('initial_state' in sample and sample['initial_state'] is not None) for sample in batch)
     initial_states = torch.stack([sample['initial_state'] for sample in batch]) if has_initial_state else None
-    
+    # World-model target: stack only if every sample provides it. Old datasets
+    # that don't emit `future_states` continue to work unchanged.
+    has_future_states = all(('future_states' in sample and sample['future_states'] is not None) for sample in batch)
+    future_states = torch.stack([sample['future_states'] for sample in batch]) if has_future_states else None
+
+    # Precomputed VAE latents (optional). Present only when the dataset has a
+    # VAE-latent cache enabled AND every sample in the batch hit the cache.
+    has_vae_latents = all(
+        ('clean_full_latent' in sample and 'condition_frame_latent' in sample) for sample in batch
+    )
+    clean_full_latent = torch.stack([sample['clean_full_latent'] for sample in batch]) if has_vae_latents else None
+    condition_frame_latent = torch.stack([sample['condition_frame_latent'] for sample in batch]) if has_vae_latents else None
+
+    # Precomputed frozen-VLM hidden states (optional). Stacked only if every sample hit.
+    has_vlm_hidden = all(('vlm_hidden' in sample and sample['vlm_hidden'] is not None) for sample in batch)
+    vlm_hidden = torch.stack([sample['vlm_hidden'] for sample in batch]) if has_vlm_hidden else None
+
     # Process VLM inputs with padding in collate_fn
     vlm_inputs = [sample.get('vlm_inputs') for sample in batch]
     processed_vlm_inputs = None
@@ -335,5 +351,12 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
 
     if initial_states is not None:
         result['initial_state'] = initial_states
-    
+    if future_states is not None:
+        result['future_states'] = future_states   # [B, H, state_dim] — world-model target
+    if clean_full_latent is not None:
+        result['clean_full_latent'] = clean_full_latent            # [B, C', T', H', W']
+        result['condition_frame_latent'] = condition_frame_latent  # [B, C', 1,  H', W']
+    if vlm_hidden is not None:
+        result['vlm_hidden'] = vlm_hidden                          # [B, seq_len, vlm_dim]
+
     return result

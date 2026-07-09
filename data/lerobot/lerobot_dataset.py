@@ -143,12 +143,42 @@ class LeRobotMotusDataset(data.Dataset):
         t5_folder_name: str = "t5_embedding",
         t5_device: Optional[str] = None,
 
+        # --- Optional: offline VAE-latent cache ---
+        # The WAN VAE encode of (first_frame + target frames) is a deterministic
+        # function of (episode_index, condition_frame_idx) when image_aug is off.
+        # When `use_vae_cache` is True, __getitem__ loads precomputed latents from
+        # `{root}/{vae_cache_folder}/episode_<true_ep>.pt` and attaches them to the
+        # sample, so the training step can skip the (expensive) VAE forward.
+        # Build the cache with `data/lerobot/build_vae_cache_offline.py`.
+        use_vae_cache: bool = False,
+        vae_cache_folder: str = "vae_latent_cache",
+
+        # --- Optional: offline VLM hidden-state cache ---
+        # The frozen Qwen3-VL forward → last-layer hidden state is deterministic given
+        # (first_frame, instruction). When `use_vlm_cache` is True, __getitem__ loads
+        # precomputed hidden states from `{root}/{vlm_cache_folder}/episode_<true_ep>.pt`
+        # and attaches them; the training step then runs only the trainable adapter.
+        # Build with `data/lerobot/build_vlm_cache_offline.py`.
+        use_vlm_cache: bool = False,
+        vlm_cache_folder: str = "vlm_hidden_cache",
+
         # Video backend: "pyav" (memory efficient) or "torchcodec" (faster but more memory)
         video_backend: Optional[str] = None,
 
         embodiment_type: str = "aloha_agilex_2", # for loading normalization statistics
         task_mode: str = "single", # "single" or "multi"
         task_name: str = "null",
+
+        # ---- Train / val split (single-task only for now) ----
+        # If `num_val_episodes > 0`, episodes are deterministically shuffled with
+        # `val_split_seed` and the last `num_val_episodes` are reserved for val.
+        # `val=True` (passed from create_dataset(..., val=True)) picks those val
+        # episodes and switches __getitem__ to deterministic chunk iteration;
+        # `val=False` keeps random chunk sampling from the remaining train set.
+        # Set num_val_episodes=0 to disable the split (legacy behavior).
+        val: bool = False,
+        num_val_episodes: int = 0,
+        val_split_seed: int = 0,
         **kwargs
     ):
         super().__init__()
@@ -191,6 +221,23 @@ class LeRobotMotusDataset(data.Dataset):
         self.t5_folder_name = str(t5_folder_name)
         self.t5_device = t5_device or ("cuda" if torch.cuda.is_available() else "cpu")
         self._t5_encoder = None  # lazy-loaded
+
+        # ---- VAE-latent cache config ----
+        self.use_vae_cache = bool(use_vae_cache)
+        self.vae_cache_folder = str(vae_cache_folder)
+        # Per-episode in-memory cache: {true_episode_index: {cond_idx: {'clean':T, 'cond':T}}}
+        self._vae_cache_mem: Dict[int, Dict[int, Dict[str, torch.Tensor]]] = {}
+
+        # ---- VLM hidden-state cache config ----
+        self.use_vlm_cache = bool(use_vlm_cache)
+        self.vlm_cache_folder = str(vlm_cache_folder)
+        # Per-episode in-memory cache: {true_episode_index: {cond_idx: hidden_tensor}}
+        self._vlm_cache_mem: Dict[int, Dict[int, torch.Tensor]] = {}
+        # Forcing hook for the offline cache builder: (episode_idx, condition_frame_idx).
+        self._forced_sample: Optional[Tuple[int, int]] = None
+        # Metadata of the most recent __getitem__ call (true_ep, cond_idx) — used by
+        # the offline builder to key the cache it writes.
+        self._last_sample_meta: Optional[Tuple[int, int]] = None
         
         # VLM processor
         self.vlm_processor = None
@@ -206,15 +253,44 @@ class LeRobotMotusDataset(data.Dataset):
                 except Exception as e:
                     logger.warning(f"Failed to load VLM processor: {e}")
 
+        # ---- Train / val split state ----
+        self.val = bool(val)
+        self.num_val_episodes = int(num_val_episodes)
+        self.val_split_seed = int(val_split_seed)
+
         # ---- Select episode subset (optional) ----
         # Read-only metadata to get total_episodes, avoiding parquet reads while conversion is ongoing.
         if self.task_mode == "single":
             meta = LeRobotDatasetMetadata(self.repo_id, root=self.root)
             total_eps = int(meta.total_episodes)
-            
+
             all_ep_ids = list(range(total_eps))
-            rng = random.Random(0)
+            # Always do the deterministic shuffle first so train/val split is reproducible.
+            rng = random.Random(self.val_split_seed)
             rng.shuffle(all_ep_ids)
+
+            if self.num_val_episodes > 0 and self.num_val_episodes < total_eps:
+                if self.val:
+                    chosen = all_ep_ids[-self.num_val_episodes:]
+                    logger.info(
+                        f"Val split: {len(chosen)} episodes "
+                        f"(seed={self.val_split_seed}, last in shuffled order): {chosen}"
+                    )
+                else:
+                    chosen = all_ep_ids[:-self.num_val_episodes]
+                    logger.info(
+                        f"Train split: {len(chosen)} episodes "
+                        f"(seed={self.val_split_seed}; first {len(chosen)} of shuffled, "
+                        f"holding out {self.num_val_episodes} for val)"
+                    )
+                all_ep_ids = chosen
+            else:
+                # Legacy behavior: no split, train and val see the same pool.
+                if self.val:
+                    logger.warning(
+                        "val=True but num_val_episodes <= 0 — train and val use the same episodes "
+                        "(legacy behavior, NOT a real held-out split)."
+                    )
 
             if self.max_episodes is not None and self.max_episodes > 0:
                 all_ep_ids = all_ep_ids[: min(self.max_episodes, len(all_ep_ids))]
@@ -269,6 +345,40 @@ class LeRobotMotusDataset(data.Dataset):
                 
                 tmp_frame_cnt += int(self.lerobot_dataset._datasets[idx].num_frames)
                 self.frame_num_accumulated.append(tmp_frame_cnt)
+
+        # ---- Build deterministic val-chunk list (single-task val mode only) ----
+        # Each entry is (local_ep_idx, condition_frame_idx). Chunks step by
+        # physical_chunk_size (non-overlapping). The LAST chunk per episode is
+        # right-aligned to (total_frames - physical_chunk_size - 1) so the final
+        # frames of the episode are always covered — this overlaps with the
+        # previous chunk only when (total_frames - 1) is not a multiple of
+        # physical_chunk_size.
+        self.val_chunks: List[Tuple[int, int]] = []
+        if self.val and self.task_mode == "single":
+            physical = self.action_chunk_size * self.global_downsample_rate
+            n_eps = self.lerobot_dataset.num_episodes
+            for local_ep_idx in range(n_eps):
+                from_t = self.lerobot_dataset.episode_data_index["from"][local_ep_idx]
+                to_t   = self.lerobot_dataset.episode_data_index["to"][local_ep_idx]
+                from_idx = int(from_t.item()) if hasattr(from_t, "item") else int(from_t)
+                to_idx   = int(to_t.item())   if hasattr(to_t, "item")   else int(to_t)
+                n_frames = to_idx - from_idx
+                max_cond = n_frames - physical - 1
+                if max_cond < 0:
+                    # Episode too short for even one chunk; emit a single best-effort chunk at 0.
+                    self.val_chunks.append((local_ep_idx, 0))
+                    continue
+                # Non-overlapping chunks at strides of physical_chunk_size.
+                conds = list(range(0, max_cond + 1, physical))
+                # Right-aligned final chunk so we cover the episode tail.
+                if not conds or conds[-1] != max_cond:
+                    conds.append(max_cond)
+                for c in conds:
+                    self.val_chunks.append((local_ep_idx, c))
+            logger.info(
+                f"Built deterministic val_chunks: {len(self.val_chunks)} chunks across "
+                f"{n_eps} val episodes (physical_chunk_size={physical} frames)."
+            )
 
         # Episode-level embedding cache (for external t5 embedding files referenced from meta/episodes.jsonl)
         # key: global episode_index (int) ; value: torch.Tensor
@@ -510,23 +620,33 @@ class LeRobotMotusDataset(data.Dataset):
                 pass
     
     def __len__(self):
-        """Return number of episodes."""
+        """
+        Train mode: a large pseudo-length (random sampler ignores idx anyway).
+        Val mode:   the exact number of deterministic chunks across val episodes.
+        """
+        if self.val and self.task_mode == "single" and len(self.val_chunks) > 0:
+            return len(self.val_chunks)
         return self.lerobot_dataset.num_episodes * 1000
-    
+
     def __getitem__(self, idx):
         """
-        Get a training sample.
-        
-        Args:
-            idx: Sample index (not used, random sampling)
-            
-        Returns:
-            Dictionary containing training data
+        Train mode: random episode + random chunk start within that episode.
+        Val mode (single-task only): deterministic — `idx` selects an entry from
+        `self.val_chunks`, i.e. a fixed (episode, condition_frame_idx) pair.
         """
         if not self.lerobot_dataset:
             return None
 
-        episode_idx = random.randint(0, self.lerobot_dataset.num_episodes - 1)
+        # Determine episode + chunk position for this idx.
+        deterministic_cond_idx: Optional[int] = None
+        if self._forced_sample is not None:
+            # Offline cache builder forces an exact (episode, condition_frame) pair.
+            episode_idx, deterministic_cond_idx = self._forced_sample
+        elif self.val and self.task_mode == "single" and len(self.val_chunks) > 0:
+            local_ep_idx, deterministic_cond_idx = self.val_chunks[idx % len(self.val_chunks)]
+            episode_idx = local_ep_idx
+        else:
+            episode_idx = random.randint(0, self.lerobot_dataset.num_episodes - 1)
         if self.task_mode == "multi":
             task_idx = self.episode_id_to_task_idx[episode_idx]
             if task_idx > 0:
@@ -541,7 +661,9 @@ class LeRobotMotusDataset(data.Dataset):
         to_idx = int(to_idx_t.item()) if hasattr(to_idx_t, "item") else int(to_idx_t)
         total_frames = int(to_idx - from_idx)
 
-        condition_frame_idx, video_indices, action_indices = self._calculate_sampling_indices(total_frames)
+        condition_frame_idx, video_indices, action_indices = self._calculate_sampling_indices(
+            total_frames, forced_condition_frame_idx=deterministic_cond_idx
+        )
 
         if self.task_mode == "multi" and task_idx > 0:
             from_idx += self.frame_num_accumulated[task_idx - 1]
@@ -716,6 +838,23 @@ class LeRobotMotusDataset(data.Dataset):
             action_sequence = torch.from_numpy(np.stack(action_values, axis=0)).float()
         else:
             action_sequence = torch.tensor(action_values, dtype=torch.float32)
+
+        # World-model target: observed joint positions AT THE SAME future timesteps as the
+        # action chunk. In contrast to RoboTwin (where qpos doubles as both), here
+        # observation.state is the encoder readback while `action` is the commanded target —
+        # they differ by tracking error / contact dynamics. We keep this as a separate key
+        # so the WM training step has an explicit non-degenerate prediction target.
+        future_states = None
+        if "observation.state" in hf_dataset.column_names:
+            state_values = hf_dataset[local_action_indices]["observation.state"]
+            if isinstance(state_values, torch.Tensor):
+                future_states = state_values.float()
+            elif isinstance(state_values, (list, tuple)) and len(state_values) > 0 and isinstance(state_values[0], torch.Tensor):
+                future_states = torch.stack([v.float() for v in state_values], dim=0)
+            elif isinstance(state_values, (list, tuple)) and len(state_values) > 0 and isinstance(state_values[0], np.ndarray):
+                future_states = torch.from_numpy(np.stack(state_values, axis=0)).float()
+            else:
+                future_states = torch.tensor(state_values, dtype=torch.float32)
         
         # Language embedding:
         # 1) Prefer parquet (legacy: each frame has `language_embedding`)
@@ -742,7 +881,26 @@ class LeRobotMotusDataset(data.Dataset):
 
                 rel_path = ep_meta.get("t5_embedding_path", None)
                 if rel_path is None:
-                    if not self.enable_t5_fallback:
+                    # Filename-convention fallback (lerobot library may rewrite
+                    # meta/episodes.jsonl on each LeRobotDatasetMetadata init,
+                    # dropping any extra fields). We look up in this order:
+                    #   1) {root}/{folder}/task_<task_index>.pt  — one embedding shared
+                    #      across all episodes that have the same instruction.
+                    #   2) {root}/{folder}/episode_<ep_index>.pt — per-episode fallback
+                    #      for legacy caches.
+                    cache_root = Path(self.lerobot_dataset.root) / self.t5_folder_name
+                    task_idx_raw = item_cond.get("task_index", None)
+                    task_candidate = None
+                    if task_idx_raw is not None:
+                        ti = int(task_idx_raw.item()) if hasattr(task_idx_raw, "item") else int(task_idx_raw)
+                        task_candidate = cache_root / f"task_{ti:06d}.pt"
+                    episode_candidate = cache_root / f"episode_{ep_index:06d}.pt"
+
+                    if task_candidate is not None and task_candidate.exists():
+                        rel_path = str(task_candidate.relative_to(self.lerobot_dataset.root))
+                    elif episode_candidate.exists():
+                        rel_path = str(episode_candidate.relative_to(self.lerobot_dataset.root))
+                    elif not self.enable_t5_fallback:
                         raise KeyError(
                             "language_embedding not found in item and t5_embedding_path not found in meta/episodes.jsonl; "
                             "you can set enable_t5_fallback=True to encode and cache T5 embeddings on-the-fly."
@@ -795,8 +953,18 @@ class LeRobotMotusDataset(data.Dataset):
 
         normalized_actions = normalize_actions(action_sequence, self.action_min, self.action_max)
         normalized_initial_state = normalize_actions(initial_state.unsqueeze(0), self.action_min, self.action_max).squeeze(0)
+        normalized_future_states = None
+        if future_states is not None:
+            # Use the same min/max as the action range — for ALOHA-style robots both are
+            # joint positions and live in the same space, so this keeps the WM target on
+            # the same scale as actions / state condition.
+            normalized_future_states = normalize_actions(future_states, self.action_min, self.action_max)
 
-        return {
+        # Record (true_episode, condition_frame) so the offline cache builder can key
+        # the latents it writes for this exact sample.
+        self._last_sample_meta = (int(ep_for_video), int(condition_frame_idx))
+
+        sample = {
             'first_frame': first_frame,
             'video_frames': video_frames_sampled,
             'initial_state': normalized_initial_state,
@@ -804,6 +972,62 @@ class LeRobotMotusDataset(data.Dataset):
             'language_embedding': language_embedding,
             'vlm_inputs': vlm_tokens,
         }
+        if normalized_future_states is not None:
+            sample['future_states'] = normalized_future_states
+
+        # Attach precomputed VAE latents when available — the training step uses these
+        # and skips the VAE forward entirely. Falls back silently (live VAE encode) if
+        # a key is missing, so a partially built cache can't crash training.
+        if self.use_vae_cache:
+            entry = self._vae_cache_get(int(ep_for_video), int(condition_frame_idx))
+            if entry is not None:
+                sample['clean_full_latent'] = entry['clean']
+                sample['condition_frame_latent'] = entry['cond']
+
+        # Attach precomputed frozen-VLM hidden state when available — the training step
+        # then runs only the trainable adapter and skips the VLM forward.
+        if self.use_vlm_cache:
+            h = self._vlm_cache_get(int(ep_for_video), int(condition_frame_idx))
+            if h is not None:
+                sample['vlm_hidden'] = h
+        return sample
+
+    def sample_at(self, episode_idx: int, condition_frame_idx: int) -> Optional[Dict[str, Any]]:
+        """Deterministically build the sample for an exact (episode, condition_frame)
+        pair. Used by the offline VAE-cache builder. Restores the random-sampling
+        behavior afterward."""
+        prev = self._forced_sample
+        self._forced_sample = (int(episode_idx), int(condition_frame_idx))
+        try:
+            return self.__getitem__(0)
+        finally:
+            self._forced_sample = prev
+
+    def _vae_cache_get(self, true_ep: int, cond_idx: int) -> Optional[Dict[str, torch.Tensor]]:
+        """Fetch {'clean','cond'} latents for (true_ep, cond_idx) from the on-disk
+        per-episode cache, with a per-episode in-memory LRU. Returns None on miss."""
+        ep_map = self._vae_cache_mem.get(true_ep)
+        if ep_map is None:
+            path = Path(self.lerobot_dataset.root) / self.vae_cache_folder / f"episode_{true_ep:06d}.pt"
+            if not path.exists():
+                self._vae_cache_mem[true_ep] = {}  # negative-cache the whole episode
+                return None
+            ep_map = torch.load(path, map_location="cpu")
+            self._vae_cache_mem[true_ep] = ep_map
+        return ep_map.get(cond_idx, None)
+
+    def _vlm_cache_get(self, true_ep: int, cond_idx: int) -> Optional[torch.Tensor]:
+        """Fetch the frozen-VLM hidden state [seq_len, vlm_dim] for (true_ep, cond_idx)
+        from the on-disk per-episode cache, with a per-episode in-memory LRU."""
+        ep_map = self._vlm_cache_mem.get(true_ep)
+        if ep_map is None:
+            path = Path(self.lerobot_dataset.root) / self.vlm_cache_folder / f"episode_{true_ep:06d}.pt"
+            if not path.exists():
+                self._vlm_cache_mem[true_ep] = {}  # negative-cache the whole episode
+                return None
+            ep_map = torch.load(path, map_location="cpu")
+            self._vlm_cache_mem[true_ep] = ep_map
+        return ep_map.get(cond_idx, None)
 
     def _resize_frame_chw(self, frame_chw: torch.Tensor, target_size: Tuple[int, int]) -> torch.Tensor:
         """Resize and pad a [C,H,W] torch float frame to target_size=(H,W), keeping [0,1]."""
@@ -819,13 +1043,19 @@ class LeRobotMotusDataset(data.Dataset):
         out = torch.from_numpy(resized).permute(2, 0, 1).float() / 255.0
         return out
     
-    def _calculate_sampling_indices(self, total_frames: int) -> Tuple[int, List[int], List[int]]:
+    def _calculate_sampling_indices(
+        self,
+        total_frames: int,
+        forced_condition_frame_idx: Optional[int] = None,
+    ) -> Tuple[int, List[int], List[int]]:
         """
         Calculate sampling indices for video and actions (following robotwin's logic).
-        
+
         Args:
             total_frames: Total number of frames in the episode
-            
+            forced_condition_frame_idx: If provided (val mode), use this instead of
+                drawing a random condition frame — makes iteration deterministic.
+
         Returns:
             - condition_frame_idx: Index of condition frame (corresponds to initial state)
             - video_indices: List of video frame indices to predict
@@ -833,13 +1063,15 @@ class LeRobotMotusDataset(data.Dataset):
         """
         # Calculate physical span of one chunk
         physical_chunk_size = self.action_chunk_size * self.global_downsample_rate
-        
+
         # Sample condition frame directly in physical space
         # Ensure the last action doesn't exceed total_frames - 1
         max_condition_idx = total_frames - physical_chunk_size - 1
-        
+
         if max_condition_idx < 0:
             condition_frame_idx = 0
+        elif forced_condition_frame_idx is not None:
+            condition_frame_idx = max(0, min(int(forced_condition_frame_idx), max_condition_idx))
         else:
             condition_frame_idx = random.randint(0, max_condition_idx)
         
