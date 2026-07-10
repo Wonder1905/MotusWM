@@ -1,183 +1,162 @@
-
 <!-- markdownlint-disable first-line-h1 -->
 <!-- markdownlint-disable html -->
 <!-- markdownlint-disable no-duplicate-header -->
 
 <div align="center">
-  <h1>Motus: A Unified Latent Action World Model</h1>
+  <h1>Motus-WM — Motus with Future-State Prediction</h1>
 </div>
 
-<div align="center" style="line-height: 1;">
-  <a href="https://motus-robotics.github.io/motus"><img alt="Homepage"
-    src="https://img.shields.io/badge/Motus-Homepage-4287f5?logo=readme&logoColor=white"/></a>
-  <a href="https://huggingface.co/motus-robotics"><img alt="Hugging Face"
-    src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-motus--robotics-ffc107?color=ffc107&logoColor=white"/></a>
-  <a href="https://arxiv.org/abs/2512.13030"><img alt="arXiv"
-    src="https://img.shields.io/badge/arXiv-2512.13030-b31b1b?logo=arxiv&logoColor=white"/></a>
-  <br>
-  <a href="https://motus-robotics.github.io/assets/motus/png/feishu.jpg"><img alt="Feishu"
-    src="https://img.shields.io/badge/Feishu-Motus-blue?logo=lark&logoColor=white"/></a>
-  <a href="https://motus-robotics.github.io/assets/motus/png/wechat.jpg"><img alt="WeChat"
-    src="https://img.shields.io/badge/WeChat-Motus-green?logo=wechat&logoColor=white"/></a>
-  <a href="LICENSE"><img alt="License"
-    src="https://img.shields.io/badge/License-Apache--2.0-f5de53?logo=apache&color=f5de53"/></a>
+<div align="center">
+  <em>A fork of <a href="https://github.com/thu-ml/Motus">Motus</a> that adds prediction of the
+  robot's <strong>future proprioceptive state</strong>, turning it into a full
+  <strong>actions-in → future-video + future-state</strong> world model.</em>
 </div>
+
+<br>
+
+> **This is a fork.** For the original Motus project — installation, checkpoints, data
+> format, the base Mixture-of-Transformers architecture, and citation — see
+> **[README_MOTUS.md](README_MOTUS.md)**. Everything below documents the world-model
+> changes layered on top.
 
 ## Table of Contents
-- [Table of Contents](#table-of-contents)
-- [Overview](#overview)
-- [Updates](#updates)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Model Checkpoints](#model-checkpoints)
-- [Data Format](#data-format)
-- [Running Inference](#running-inference)
-- [Training](#training)
-- [Troubleshooting](#troubleshooting)
-- [Citation](#citation)
+- [What this repo does](#what-this-repo-does)
+  - [What goes in and out](#what-goes-in-and-out)
+- [What we changed](#what-we-changed)
+  - [New modules](#new-modules)
+  - [Wiring, data, and loss](#wiring-data-and-loss)
+- [Data: download and preprocess](#data-download-and-preprocess)
+- [Training, sampling, and eval](#training-sampling-and-eval)
+- [Faster training: offline frozen-encoder caches](#faster-training-offline-frozen-encoder-caches)
+- [Configuration reference](#configuration-reference)
+- [File map](#file-map)
 
-## Overview
+## What this repo does
 
-**Motus** is a **unified latent action world model** that leverages existing pretrained models and rich, sharable motion information. Motus introduces a **Mixture-of-Transformers (MoT)** architecture to integrate three experts (understanding, action, and video generation) and adopts a **UniDiffuser-style scheduler** to enable flexible switching between different modeling modes (World Models, Vision-Language-Action Models, Inverse Dynamics Models, Video Generation Models, and Video-Action Joint Prediction Models). Motus further leverages **optical flow** to learn **latent actions** and adopts a **three-phase training pipeline** and **six-layer data pyramid**, thereby extracting pixel-level "delta action" and enabling large-scale action pretraining.
+Motus is a **unified latent action world model** (see [README_MOTUS.md](README_MOTUS.md)): a
+Mixture-of-Transformers over three experts — understanding, action, and video generation — with a
+UniDiffuser-style scheduler that switches between modeling modes (world model, VLA, inverse
+dynamics, video generation, video-action joint prediction). It predicts **future video** and can
+consume actions as a clean input; the robot's proprioceptive **state**, however, enters only as a
+single conditioning token and is not predicted into the future.
 
-| Component | Base Model | Parameters |
-|-----------|------------|------------|
-| **VGM (Video Generation Model)** | [Wan2.2-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B) | ~5.00B |
-| **VLM (Vision-Language Model)** | [Qwen3-VL-2B](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct) | ~2.13B |
-| **Action Expert** | - | ~641.5M |
-| **Understanding Expert** | - | ~253.5M |
-| **Total** | - | **~8B** |
+This fork adds that missing piece: Motus now also predicts the robot's **future joint state** as
+part of the future state it rolls out (alongside the video). The model's contract becomes —
+*current world + the actions the agent intends to take → future video + future joint states:*
 
-**Key Results (RoboTwin 2.0 Simulation.** With 50 clean and 500 randomized data entries per task, we merge the data from all 50 tasks for multi-task training.):
-- **87.02%** average success rate (+15% over X-VLA, +45% over π₀.₅)
+```
+                ┌────────────────────────┐
+  current image ─►                        ─► future video         (T frames)
+  current state ─►       Motus-WM         ─►
+  H actions     ─►                        ─► future joint states  (H steps)
+                └────────────────────────┘
+```
 
-## Updates
+### What goes in and out
 
-- [2025-12-16] **Initial release of Motus with pretrained checkpoints and training code.**
-- [2025-12-20] **Simple RoboTwin inference**
-- [2025-12-24] **LeRobotDataset format support**  
-- [2025-12-24] **Optimized training scripts**
-- [2025-12-26] **MultiLeRobotDataset format support**
-- [2025-12-27] **RoboTwin raw dataset conversion**
-- [2025-12-27] **Three-view image concatenation scripts**
+Dimensions (defined once, used throughout):
 
-We welcome community members to help maintain and extend Motus. Welcome to join the Motus community and contribute together!
+- `B` — batch size
+- `H` — prediction horizon (number of future action / state steps)
+- `T` — number of predicted video frames
+- `S` — state dimension (per-joint proprioception)
+- `A` — action dimension
+- video tensors are `[B, T, C, h, w]` — WAN VAE latents (`C` channels, `h × w` latent grid)
 
-## Requirements
+**Base Motus (VLA / action-generation mode)**
+```
+inputs  (clean)    : current image(s), current state [B, 1, S], instruction (T5)
+outputs (denoised) : actions [B, H, A]  +  future video [B, T, C, h, w]
+```
 
-| Mode | VRAM | Recommended GPU |
-|------|------|-----------------|
-| Inference (with pre-encoded T5) | > 24 GB | RTX 5090 |
-| Inference (without pre-encoded T5) | ~ 41 GB | A100 (40GB) / A100 (80GB) / H100 / B200 |
-| Training | > 80 GB | A100 (80GB) / H100 / B200 |
+**Motus-WM (this fork)**
+```
+inputs  (clean)    : current image(s), current state [B, 1, S], instruction (optional),
+                     actions [B, H, A]          ← was an output, now a clean input
+outputs (denoised) : future joint states [B, H, S]   ← NEW target (base Motus never predicted this)
+                     + future video [B, T, C, h, w]
+```
 
-## Installation
+In short: **actions move from output → clean input**, and **future joint states become a new
+denoising target** alongside the video (which is unchanged). Enabled by `model.world_model: true`;
+with the flag off, the original Motus path is untouched.
+
+## What we changed
+
+### New modules
+
+| Module | File | Role |
+|--------|------|------|
+| **ActionConditioner** | [models/action_conditioner.py](models/action_conditioner.py) | Encodes the clean action chunk `[B, H, A]` into per-step action tokens `[B, H, dim]`. Never noised. |
+| **ActionInjector** | [models/action_injector.py](models/action_injector.py) | Adds the action tokens directly into WAN's video-token stream (additive injection), so the video DiT sees the actions and not only the state stream. |
+| **StateExpert** | [models/state_expert.py](models/state_expert.py) | An ActionExpert-shaped expert that consumes current state + noised future states + action tokens and predicts the future-state velocity (flow matching). **This is the new denoising target.** |
+
+All three are additive — instantiated only when `world_model` is on; the base pipeline does not
+import them, so the original VLA path is untouched.
+
+### Wiring, data, and loss
+
+- **Model** ([models/motus.py](models/motus.py)) — a `world_model` branch runs the trimodal
+  MoT joint-attention with the **state** stream in the slot the action stream used to occupy
+  (`process_joint_attention_wm`), plus a dedicated world-model forward and `inference_step_wm`.
+- **Data** ([data/dataset.py](data/dataset.py),
+  [data/lerobot/lerobot_dataset.py](data/lerobot/lerobot_dataset.py)) — each sample now exposes
+  the action chunk `action[t : t+H]` as a **clean input** and the shifted slice
+  `state[t+1 : t+1+H]` as the **flow-matching target**.
+- **Loss** ([models/motus.py](models/motus.py)) — `L = w_v · L_video + w_s · L_state` (the old
+  action loss is dropped). `L_state` comes in **two types**, selected by `model.loss_term`:
+    - **`fm`** (default) — plain flow-matching MSE on the state-velocity prediction.
+    - **`focal_fm`** — the same squared error, but each timestep is reweighted by the ground-truth
+      tracking residual `|state − action|` (mean over joints, `(· + 1e-3)^0.7`, batch-normalized to
+      mean ≈ 1), focusing capacity where the state diverges from the commanded action; it
+      degenerates to `fm` when residuals are uniform.
+- **Warm-start** — the StateExpert can be seeded from a trained ActionExpert checkpoint
+  (`warmup_action_expert_ckpt`): blocks, time embedding, registers, and encoders transfer 1:1;
+  the output head is left zero-init.
+
+> **Note:** an experimental fused Triton AdaLN-LayerNorm kernel was tried and **removed** — it
+> benchmarked faster in isolation but gave ~0% end-to-end speedup. The model uses the original
+> eager AdaLN LayerNorm.
+
+## Data: download and preprocess
+
+The reference dataset is the LeRobot **`aloha_static_towel`** set (50 episodes, 14-DoF bimanual
+ALOHA, **v2.1** format — it ships `meta/episodes.jsonl` and `meta/tasks.jsonl`, so no metadata
+build is needed).
+
+**1. Download** into the path the config expects (`dataset.params.root`):
 
 ```bash
-# Clone the repository
-git clone https://github.com/thu-ml/Motus.git
-cd Motus
-
-# Create conda environment
-conda create -n motus python=3.10 -y
-conda activate motus
-
-# install torch (cuda12.8)
-pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
-
-# install flash 
-pip install flash-attn --no-build-isolation
-
-# Install motus dependencies
-pip install -r requirements.txt
-
-# (Optinal) Install lerobot dependencies
-pip install --no-deps lerobot==0.3.2
-pip install -r requirements/lerobot.txt
+huggingface-cli download lerobot/aloha_static_towel \
+    --repo-type dataset --local-dir data_lerobot/aloha_static_towel
 ```
 
-## Model Checkpoints
+Set `HF_TOKEN` in your environment first (the LeRobot version check requires it).
 
-We provide multiple checkpoints for different use cases:
+**2. Normalization stats — already provided.** Per-joint min/max for `aloha_static_towel` (union
+of the action + state streams) ship in [data/utils/stat.json](data/utils/stat.json), keyed by
+`dataset.params.embodiment_type`. Nothing to run for the reference dataset.
 
-| Model | Use Case | Description | Checkpoint Path |
-|-------|----------|-------------|-----------------|
-| **Motus_Wan2_2_5B_pretrain** | Pretrain / VGM Backbone | Stage 1 VGM pretrained checkpoint | [`motus-robotics/Motus_Wan2_2_5B_pretrain`](https://huggingface.co/motus-robotics/Motus_Wan2_2_5B_pretrain) |
-| **Motus** | Fine-Tuning | Stage 2 latent action pretrained checkpoint | [`motus-robotics/Motus`](https://huggingface.co/motus-robotics/Motus) |
-| **Motus_robotwin2** | Inference / Fine-Tuning | Stage 3 RoboTwin2 fine-tuned checkpoint | [`motus-robotics/Motus_robotwin2`](https://huggingface.co/motus-robotics/Motus_robotwin2) |
+**3. T5 text-embedding cache — required.** The config sets `enable_t5_fallback: false`, so the
+loader reads text embeddings from disk rather than running T5 live. Build them once:
 
-**Download checkpoints:**
 ```bash
-# Create pretrained models directory
-mkdir -p pretrained_models
-
-# Download Motus checkpoints
-huggingface-cli download motus-robotics/Motus_Wan2_2_5B_pretrain --local-dir ./pretrained_models/Motus_Wan2_2_5B_pretrain
-huggingface-cli download motus-robotics/Motus --local-dir ./pretrained_models/Motus
-huggingface-cli download motus-robotics/Motus_robotwin2 --local-dir ./pretrained_models/Motus_robotwin2
-
-# Download foundation models
-huggingface-cli download Qwen/Qwen3-VL-2B-Instruct --local-dir ./pretrained_models/Qwen3-VL-2B-Instruct
-huggingface-cli download Wan-AI/Wan2.2-TI2V-5B --local-dir ./pretrained_models/Wan2.2-TI2V-5B
+python data/lerobot/build_t5_cache_offline.py \
+    --root data_lerobot/aloha_static_towel --wan_path pretrained_models
 ```
 
-**Update config paths** in your embodiment-specific config file (e.g., `configs/robotwin.yaml`, `configs/ac_one.yaml`, or other embodiment configs):
-```yaml
-model:
-  wan:
-    checkpoint_path: "./pretrained_models/Motus_Wan2_2_5B_pretrain"
-    config_path: "./pretrained_models/Motus_Wan2_2_5B_pretrain"
-    vae_path: "./pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
-  vlm:
-    checkpoint_path: "./pretrained_models/Qwen3-VL-2B-Instruct"
-    config_path: "./pretrained_models/Qwen3-VL-2B-Instruct"
-```
+This encodes each unique task string with WAN's T5 encoder into
+`data_lerobot/aloha_static_towel/t5_embedding/task_<idx>.pt` and patches `episodes.jsonl` with the
+pointer. (Set `enable_t5_fallback: true` in the config to skip this and encode live instead.)
 
-## Data Format
+**4. (Optional) VAE / VLM caches** speed up training — see
+[Faster training](#faster-training-offline-frozen-encoder-caches).
 
-Motus supports three types of datasets with specific directory structures for optimal training and inference.
+**5. Train** — see [Training, sampling, and eval](#training-sampling-and-eval).
 
-**📖 See detailed guide:** [**Data Format Guide**](DATA_FORMAT.md)
+## Training, sampling, and eval
 
-**Quick Overview:**
-- **RoboTwin 2.0**: Simulation data with clean/randomized splits
-- **Real-World**: AC-One, Aloha-Agilex-2 robot data
-
-**Data Conversion Tools:**
-- [RoboTwin Dataset Converter](data/robotwin2/robotwin_data_convert/README.md)
-- [Multi-Camera Concatenation](data/utils/multi_camera_concat.py)
-
-## Running Inference
-
-**📖 See detailed guide:** [**Inference Guide**](INFERENCE.md)
-
-- **RoboTwin 2.0**: [Evaluation Setup](inference/robotwin/Motus/README.md)
-- **Real-World**: Minimal inference without robot environment
-
-## Training
-
-Motus follows a **three-stage training pipeline**:
-
-| Stage | Data | Training |
-|-------|------|----------|
-| **Pretrained Foundation Models** | Level 1: Web Data | VGM and VLM |
-| **Stage 1 (VGM Training)** | Level 2: Egocentric Human Videos<br>Level 3: Synthetic Data<br>Level 5: Multi-Robot Task Trajectory | Only VGM |
-| **Stage 2 (Motus Pretraining)** | Level 2: Egocentric Human Videos<br>Level 3: Synthetic Data<br>Level 4: Task-agnostic Data<br>Level 5: Multi-Robot Task Trajectory | Motus (all 3 experts, with **latent actions**) |
-| **Stage 3 (Motus SFT)** | Level 6: Target-Robot Task Trajectory | Motus (all 3 experts, with actions) |
-
-The six-layer data pyramid is shown in the figure here:
-
-<img width="615" height="455" alt="image" src="https://github.com/user-attachments/assets/b1389887-2f6b-4e82-87f9-08f0525301b5" />
-
-**📖 See detailed guide:** [**Training Guide**](TRAINING.md)
-
-**Data Preparation:**
-- [RoboTwin Dataset Converter](data/robotwin2/robotwin_data_convert/README.md)
-- [Multi-Camera Concatenation](data/utils/multi_camera_concat.py)
-
-### World-Model Training (single GPU)
-
-Train in world-model mode (clean actions in → future states + video out) on a LeRobot dataset:
+**Train** (single GPU) on a LeRobot dataset in world-model mode:
 
 ```bash
 torchrun --nnodes=1 --nproc_per_node=1 --node_rank=0 \
@@ -189,41 +168,88 @@ torchrun --nnodes=1 --nproc_per_node=1 --node_rank=0 \
     --report_to wandb
 ```
 
-**(Optional) Precompute frozen-encoder caches for ~1.3–1.5× faster steps.**
-The WAN VAE and Qwen3-VL forwards are frozen and depend only on the (fixed) input
-frames, so their outputs can be cached offline once and reused every step. Build them
-before training (one-time, ~15 min each); `use_vae_cache` / `use_vlm_cache` are already
-enabled in `configs/_wm_aloha_towel.yaml`, and the loader falls back to live compute for
-any missing key, so this is safe to skip.
+**Evaluate** a checkpoint — runs the WM inference step on held-out samples and writes
+state-prediction metrics plus GT-vs-prediction video grids and state plots:
 
 ```bash
-# VAE latents  → data_lerobot/<dataset>/vae_latent_cache/   (~1.3 GB)
+python scripts/wm_eval.py \
+    --ckpt checkpoints_lerobot/<run>/checkpoint_step_<N>/pytorch_model/mp_rank_00_model_states.pt \
+    --config configs/_wm_aloha_towel.yaml \
+    --num_samples 4 --out_dir eval_outputs/<run>
+```
+
+Metric definitions live in [train/eval_metrics.py](train/eval_metrics.py) (per-joint errors in
+the robot's native units, un-normalized with the dataset's min/max). Rollout / sampling logic
+is in [train/sample.py](train/sample.py).
+
+## Faster training: offline frozen-encoder caches
+
+In world-model training, the frozen **WAN VAE** and **Qwen3-VL** forwards depend only on the
+(fixed) input frames — so with `image_aug: false` their outputs are a deterministic function of
+`(episode, condition frame)` and can be computed **once, offline** and read from disk every step
+instead of recomputed. This is the main training speedup in the fork. (The T5 text cache is a
+*required* preprocessing step for the reference config — see
+[Data](#data-download-and-preprocess).)
+
+| Cache | Builder | Skips (per step) | Enabled by |
+|-------|---------|------------------|------------|
+| **VAE** latents | [build_vae_cache_offline.py](data/lerobot/build_vae_cache_offline.py) | frozen WAN VAE encode (~25% of step) | `use_vae_cache: true` |
+| **VLM** hidden states | [build_vlm_cache_offline.py](data/lerobot/build_vlm_cache_offline.py) | frozen Qwen3-VL forward (~11% of step) | `use_vlm_cache: true` |
+
+Both read from disk when a key is present and **fall back to live compute** for any missing key —
+so they are safe to enable before building, and safe to skip entirely. A shared fast whole-episode
+frame decoder ([_cache_decode.py](data/lerobot/_cache_decode.py)) does one sequential pass per
+episode instead of re-seeking the mp4 for every frame.
+
+Build them once before training:
+
+```bash
 python data/lerobot/build_vae_cache_offline.py --config configs/_wm_aloha_towel.yaml
-# VLM hidden states → data_lerobot/<dataset>/vlm_hidden_cache/   (~6.5 GB)
 python data/lerobot/build_vlm_cache_offline.py --config configs/_wm_aloha_towel.yaml
 ```
 
-## Troubleshooting
+## Configuration reference
 
-**📖 Detailed guides:**
-- [Inference Issues](INFERENCE.md#troubleshooting)
-- [Training Issues](TRAINING.md#troubleshooting)
-- [Data Format Issues](DATA_FORMAT.md)
+The reference world-model config is
+[configs/_wm_aloha_towel.yaml](configs/_wm_aloha_towel.yaml) (ALOHA static-towel, 14-DoF
+bimanual). Key world-model knobs:
 
-## Citation
-If you find our work helpful, please cite us:
+| Key | Meaning |
+|-----|---------|
+| `model.world_model` | Turn world-model (future-state) mode on. |
+| `model.loss_term` | `fm` (plain flow-matching MSE) or `focal_fm` (residual-reweighted). |
+| `model.warmup_action_expert_ckpt` | Checkpoint to seed the StateExpert from (or `null`). |
+| `common.action_dim` / `state_dim` | Action `A` and state `S` dimensionality. |
+| `common.num_video_frames` / `video_action_freq_ratio` | `T` = num_video_frames; horizon `H` = `T` × video_action_freq_ratio. |
+| `dataset.image_aug` | Must be `false` to use the caches (they assume deterministic inputs). |
+| `dataset.params.use_vae_cache` / `use_vlm_cache` | Enable the offline caches. |
+| `dataset.params.num_val_episodes` / `val_split_seed` | Deterministic held-out validation split. |
 
-```bibtex
-@misc{bi2025motusunifiedlatentaction,
-      title={Motus: A Unified Latent Action World Model}, 
-      author={Hongzhe Bi and Hengkai Tan and Shenghao Xie and Zeyuan Wang and Shuhe Huang and Haitian Liu and Ruowen Zhao and Yao Feng and Chendong Xiang and Yinze Rong and Hongyan Zhao and Hanyu Liu and Zhizhong Su and Lei Ma and Hang Su and Jun Zhu},
-      year={2025},
-      eprint={2512.13030},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2512.13030}, 
-}
+Base model paths (WAN, Qwen3-VL), checkpoints, and install steps are unchanged from upstream —
+see [README_MOTUS.md](README_MOTUS.md).
+
+## File map
+
+World-model additions on top of Motus:
+
+```
+models/action_conditioner.py             clean action chunk → action tokens
+models/action_injector.py                inject action tokens into WAN video stream
+models/state_expert.py                   future-state denoising expert
+models/motus.py                          world_model forward + inference_step_wm (wiring)
+data/dataset.py                          WM sample assembly (clean actions, state target)
+data/lerobot/lerobot_dataset.py          LeRobot loader + cache lookups
+data/lerobot/build_t5_cache_offline.py   offline T5 text-embedding cache
+data/lerobot/build_vae_cache_offline.py  offline WAN-VAE latent cache
+data/lerobot/build_vlm_cache_offline.py  offline Qwen3-VL hidden-state cache
+data/lerobot/_cache_decode.py            shared fast episode frame decode
+train/train.py                           WM loss (video + state), focal_fm, param groups
+train/sample.py                          joint video + state rollout
+train/eval_metrics.py                    state-prediction metrics
+scripts/wm_eval.py                       WM eval CLI (metrics + GT-vs-pred media)
+configs/_wm_aloha_towel.yaml             reference world-model config
 ```
 
-Thank you!
+---
 
+For the original Motus documentation, see **[README_MOTUS.md](README_MOTUS.md)**.
