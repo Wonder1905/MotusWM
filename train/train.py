@@ -378,10 +378,8 @@ class UniDiffuserTrainer:
                     self._timing_buf["opt"].append(b.elapsed_time(o))
                     self._timing_buf["total"].append(t0.elapsed_time(o))
                 self._timing_buf["__pending"].clear()
-                from models.triton_kernels import get_use_triton_ln
-                flag_state = "ON" if get_use_triton_ln() else "OFF"
                 logger.info(
-                    f"[step-timing | triton_ln={flag_state}] "
+                    f"[step-timing] "
                     f"fwd={sum(self._timing_buf['fwd'])/len(self._timing_buf['fwd']):.1f}ms "
                     f"bwd={sum(self._timing_buf['bwd'])/len(self._timing_buf['bwd']):.1f}ms "
                     f"opt={sum(self._timing_buf['opt'])/len(self._timing_buf['opt']):.1f}ms "
@@ -542,7 +540,6 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple:
         world_model=bool(getattr(config.model, 'world_model', False)),
         loss_term=str(getattr(config.model, 'loss_term', 'fm') or 'fm'),
         warmup_action_expert_ckpt=getattr(config.model, 'warmup_action_expert_ckpt', None),
-        use_triton_kernels=bool(getattr(config.model, 'use_triton_kernels', True)),
     )
     
     # Create model (Accelerator will handle device placement and DDP)

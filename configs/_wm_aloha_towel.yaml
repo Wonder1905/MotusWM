@@ -85,7 +85,6 @@ model:
   # WM warm-start: seed StateExpert from a trained ActionExpert (RoboTwin2, 14-DoF bimanual).
   # Transfers blocks + time + registers + encoders 1:1; head left zero-init. Set null to disable.
   warmup_action_expert_ckpt: "/home/ubuntu/Motus/pretrained_models/Motus_robotwin2/mp_rank_00_model_states.pt"
-  use_triton_kernels: true             # ← Triton fused AdaLN-LN kernel. Set false for eager A/B baseline.
 
 training:
   batch_size: 32

@@ -25,7 +25,6 @@ from .und_expert import UndExpert, UndExpertConfig
 from .state_expert import StateExpert, StateExpertConfig
 from .action_conditioner import ActionConditioner, ActionConditionerConfig
 from .action_injector import ActionInjector, ActionInjectorConfig
-from .triton_kernels import fused_modulated_ln, set_use_triton_ln
 # Add Flow-Matching schedulers
 from wan.utils.fm import FlowMatchScheduler
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
@@ -89,11 +88,6 @@ class MotusConfig:
     # False (default) → existing VLA pipeline: predict actions + video.
     # True            → predict future_states + video; actions become clean input.
     world_model: bool = False
-
-    # Use Triton kernels for fused ops where available (currently: AdaLN-modulated LN).
-    # Set to False for eager fallback — useful for A/B benchmarking and bisecting
-    # numerical issues. Env var MOTUS_TRITON_LN=0 also disables.
-    use_triton_kernels: bool = True
 
     # State-loss reduction (world-model mode only):
     #   'fm'        → standard per-element MSE on the velocity prediction (default).
@@ -225,10 +219,7 @@ class VideoModule(nn.Module):
         v_mod = video_adaln_modulation
 
         # WAN FFN with AdaLN (params 3,4,5 for FFN: α3, β3, γ3)
-        ffn_input = fused_modulated_ln(
-            video_tokens, v_mod[4].squeeze(2), v_mod[3].squeeze(2),
-            eps=wan_layer.norm2.eps,
-        )
+        ffn_input = wan_layer.norm2(video_tokens).float() * (1 + v_mod[4].squeeze(2)) + v_mod[3].squeeze(2)
         ffn_out = wan_layer.ffn(ffn_input)
 
         with torch.amp.autocast('cuda', dtype=torch.float32):
@@ -259,14 +250,8 @@ class VideoModule(nn.Module):
         a_mod = action_adaln_modulation
 
         # Pre-attn normalization with AdaLN
-        norm_video = fused_modulated_ln(
-            video_tokens, v_mod[1].squeeze(2), v_mod[0].squeeze(2),
-            eps=wan_layer.norm1.eps,
-        )
-        norm_action = fused_modulated_ln(
-            action_tokens, a_mod[1].squeeze(2), a_mod[0].squeeze(2),
-            eps=action_block.norm1.eps,
-        )
+        norm_video = wan_layer.norm1(video_tokens).float() * (1 + v_mod[1].squeeze(2)) + v_mod[0].squeeze(2)
+        norm_action = action_block.norm1(action_tokens).float() * (1 + a_mod[1].squeeze(2)) + a_mod[0].squeeze(2)
 
         # Get dimensions
         B, L_v, C = norm_video.shape
@@ -340,14 +325,8 @@ class VideoModule(nn.Module):
         v_mod = video_adaln_modulation
         s_mod = state_adaln_modulation
 
-        norm_video = fused_modulated_ln(
-            video_tokens, v_mod[1].squeeze(2), v_mod[0].squeeze(2),
-            eps=wan_layer.norm1.eps,
-        )
-        norm_state = fused_modulated_ln(
-            state_tokens, s_mod[1].squeeze(2), s_mod[0].squeeze(2),
-            eps=state_block.norm1.eps,
-        )
+        norm_video = wan_layer.norm1(video_tokens).float() * (1 + v_mod[1].squeeze(2)) + v_mod[0].squeeze(2)
+        norm_state = state_block.norm1(state_tokens).float() * (1 + s_mod[1].squeeze(2)) + s_mod[0].squeeze(2)
 
         B, L_v, C = norm_video.shape
         L_s = norm_state.shape[1]
@@ -606,10 +585,7 @@ class ActionModule(nn.Module):
         a_mod = action_adaln_modulation
 
         # Apply FFN with AdaLN modulation (params 3,4,5 for FFN: α3, β3, γ3)
-        ffn_input = fused_modulated_ln(
-            action_tokens, a_mod[4].squeeze(2), a_mod[3].squeeze(2),
-            eps=action_block.norm2.eps,
-        )
+        ffn_input = action_block.norm2(action_tokens).float() * (1 + a_mod[4].squeeze(2)) + a_mod[3].squeeze(2)
         ffn_out = action_block.ffn(ffn_input)
         
         with torch.amp.autocast('cuda', dtype=torch.float32):
@@ -625,12 +601,6 @@ class Motus(nn.Module):
     def __init__(self, config: MotusConfig):
         super().__init__()
         self.config = config
-
-        # Apply Triton-kernels flag. Module-level state in models.triton_kernels;
-        # env var MOTUS_TRITON_LN sets the initial default, this config field
-        # overrides it. set_use_triton_ln() can flip it later for A/B bench.
-        set_use_triton_ln(getattr(config, "use_triton_kernels", True))
-        logger.info(f"Triton modulated-LN kernel: {'ON' if config.use_triton_kernels else 'OFF (eager fallback)'}")
 
         # Set unified data type for the model
         self.dtype = torch.bfloat16
@@ -1343,10 +1313,7 @@ class Motus(nn.Module):
                 # State expert FFN (mirrors ActionModule.process_ffn but on state stream).
                 state_block = self.state_expert.blocks[layer_idx]
                 s_mod = state_modulation
-                ffn_in = fused_modulated_ln(
-                    state_tokens, s_mod[4].squeeze(2), s_mod[3].squeeze(2),
-                    eps=state_block.norm2.eps,
-                )
+                ffn_in = state_block.norm2(state_tokens).float() * (1 + s_mod[4].squeeze(2)) + s_mod[3].squeeze(2)
                 ffn_out = state_block.ffn(ffn_in)
                 with torch.amp.autocast('cuda', dtype=torch.float32):
                     state_tokens = state_tokens + ffn_out * s_mod[5].squeeze(2)
@@ -1676,10 +1643,7 @@ class Motus(nn.Module):
                     # State expert FFN (mirrors WM training step).
                     state_block = self.state_expert.blocks[layer_idx]
                     s_mod = state_modulation
-                    ffn_in = fused_modulated_ln(
-                        state_tokens, s_mod[4].squeeze(2), s_mod[3].squeeze(2),
-                        eps=state_block.norm2.eps,
-                    )
+                    ffn_in = state_block.norm2(state_tokens).float() * (1 + s_mod[4].squeeze(2)) + s_mod[3].squeeze(2)
                     ffn_out = state_block.ffn(ffn_in)
                     with torch.amp.autocast('cuda', dtype=torch.float32):
                         state_tokens = state_tokens + ffn_out * s_mod[5].squeeze(2)
