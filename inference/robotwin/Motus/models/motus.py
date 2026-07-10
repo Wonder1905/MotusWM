@@ -1,6 +1,6 @@
 # Motus - Modular Architecture
 # Three-modal UniDiffuser: Video Model (WAN) + Action Expert + Understanding Expert
-# Implements MoT (Mixture of Tokens) architecture with unified attention
+# Implements MoT (Mixture-of-Transformers) architecture with unified attention
 
 import sys
 import json
