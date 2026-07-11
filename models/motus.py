@@ -759,6 +759,13 @@ class Motus(nn.Module):
             for p in self.action_expert.parameters():
                 p.requires_grad = False
 
+            # The understanding expert is a frozen conditioning path in WM mode
+            # (instruction / VLM features). Only the new world-model modules train
+            # — StateExpert + ActionConditioner + ActionInjector. Without this freeze
+            # und_expert silently receives gradients through the joint attention.
+            for p in self.und_expert.parameters():
+                p.requires_grad = False
+
             # Optional warm-start: seed the StateExpert from a trained ActionExpert.
             warm_ckpt = getattr(config, 'warmup_action_expert_ckpt', None)
             if warm_ckpt:
