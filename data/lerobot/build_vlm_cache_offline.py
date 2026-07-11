@@ -17,7 +17,7 @@ Parity: this reuses `UndModule.extract_und_hidden`, the exact pre-adapter path t
 training step would otherwise run.
 
 Run (after the VAE build finishes, to avoid GPU contention):
-    cd /home/ubuntu/Motus && HF_TOKEN=... \
+    cd <repo-root> && HF_TOKEN=... \
     .venv/bin/python data/lerobot/build_vlm_cache_offline.py --config configs/_wm_aloha_towel.yaml
 """
 from __future__ import annotations

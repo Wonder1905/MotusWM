@@ -17,7 +17,7 @@ Parity: the encode path here (Wan2_2_VAE.encode under no_grad, bf16 input) is th
 exact same call `WanVideoModel.encode_video` makes in training.
 
 Run:
-    cd /home/ubuntu/Motus && HF_TOKEN=... \
+    cd <repo-root> && HF_TOKEN=... \
     .venv/bin/python data/lerobot/build_vae_cache_offline.py --config configs/_wm_aloha_towel.yaml
 """
 from __future__ import annotations
