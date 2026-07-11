@@ -27,11 +27,12 @@
 ## Overview
 
 Motus is a unified latent-action world model — a Mixture-of-Transformers over understanding,
-action, and video-generation experts with a UniDiffuser-style scheduler. It predicts future video
-and can take actions as a clean input, but never predicts the robot's proprioceptive **state**:
-state enters as a single conditioning token and is never rolled forward.
+action, and video-generation experts with a UniDiffuser-style scheduler. Its implemented path
+predicts future video **and** the action chunk; the robot's proprioceptive **state** enters only as
+a single conditioning token and is never predicted.
 
-MotusWM adds that — it also predicts the **future joint state**, so the contract becomes
+MotusWM re-wires it: actions become a **clean input** (via the new ActionConditioner +
+ActionInjector) and the **future joint state** becomes a prediction target — so the contract becomes
 *current image + state + intended actions → future video + future joint states*:
 
 ```
@@ -62,7 +63,7 @@ Actions move from output to clean input; future joint states become a new denois
 
 ## What changed
 
-**New modules** (instantiated only in `world_model` mode; the stock path never imports them):
+**New modules** (instantiated only in `world_model` mode; the stock path never uses them):
 
 | Module | File | Role |
 |--------|------|------|
@@ -71,22 +72,26 @@ Actions move from output to clean input; future joint states become a new denois
 | **StateExpert** | [models/state_expert.py](models/state_expert.py) | ActionExpert-shaped; consumes current state + noised future states + action tokens and predicts the future-state velocity. The new denoising target. |
 
 **What trains** — only the new world-model modules (StateExpert + action conditioner/injector).
-Everything else is frozen — WAN video DiT + VAE, Qwen3-VL (VLM), T5, the understanding expert, and
-the original action expert — so a run fits on a single 80 GB GPU (A100).
+Everything else is frozen — WAN video DiT + VAE, Qwen3-VL (VLM), the understanding expert, and the
+original action expert — so a run fits on a single 80 GB GPU (A100) in our runs. (T5 isn't in the
+training model; its embeddings are precomputed offline.)
 
 **Wiring** ([models/motus.py](models/motus.py)) — a `world_model` branch runs the trimodal MoT
 joint-attention with the state stream in the old action slot (`process_joint_attention_wm`), plus
 a WM forward and `inference_step_wm`.
 
 **Data** ([data/dataset.py](data/dataset.py),
-[data/lerobot/lerobot_dataset.py](data/lerobot/lerobot_dataset.py)) — each sample exposes
-`action[t:t+H]` as a clean input and `state[t+1:t+1+H]` as the flow-matching target.
+[data/lerobot/lerobot_dataset.py](data/lerobot/lerobot_dataset.py)) — the current state is a
+conditioning token; at the **same** H future (downsampled) steps, the commanded action chunk
+`[B,H,A]` is a clean input and the *observed* joint state `[B,H,S]` is the flow-matching target.
+They differ only by tracking error — which `focal_fm` exploits.
 
 **Loss** ([models/motus.py](models/motus.py)) — `L = w_v·L_video + w_s·L_state` (action loss
 dropped; `w_s` = `loss_weights.action_loss_weight`). `L_state` has two types via `model.loss_term`:
 - **`fm`** (default) — flow-matching MSE on the state velocity.
 - **`focal_fm`** — same error, reweighted per timestep by the tracking residual `|state − action|`
-  (mean over joints, `(·+1e-3)^0.7`, batch-normalized); degenerates to `fm` when residuals are uniform.
+  (mean over joints, `(·+1e-3)^0.7`, batch-normalized); degenerates to `fm` when residuals are
+  uniform, and requires `A == S` (otherwise it silently runs `fm`).
 
 **Warm-start** — `warmup_action_expert_ckpt` seeds the StateExpert from a trained ActionExpert
 (blocks / time / registers / encoders transfer 1:1; head zero-init).
@@ -134,7 +139,7 @@ Evaluate a checkpoint — writes state-prediction metrics and GT-vs-prediction v
 
 ```bash
 python scripts/wm_eval.py \
-    --ckpt checkpoints_lerobot/<run>/checkpoint_step_<N>/pytorch_model/mp_rank_00_model_states.pt \
+    --ckpt checkpoints_lerobot/_wm_aloha_towel/wm_aloha_towel_focal/checkpoint_step_<N>/pytorch_model/mp_rank_00_model_states.pt \
     --config configs/_wm_aloha_towel.yaml --num_samples 4 --out_dir eval_outputs/<run>
 ```
 
@@ -153,7 +158,8 @@ The frozen WAN VAE and Qwen3-VL forwards depend only on the fixed input frames, 
 
 _The ~25% / ~11% step-time shares are from our own profiling, not a formal benchmark._
 
-Missing keys fall back to live compute, so both are safe to skip or to enable before building.
+Missing keys fall back to live compute — per **batch** (one miss recomputes that modality for the
+whole batch), not per sample — so both are safe to skip or to enable before building.
 A shared decoder ([_cache_decode.py](data/lerobot/_cache_decode.py)) reads each episode in one pass
 instead of re-seeking per frame. Build once:
 
