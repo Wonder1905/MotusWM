@@ -36,19 +36,19 @@ dataset:
 
     # When t5_embedding is missing, encode on-the-fly and cache it to {root}/t5_embedding/episode_XXXXXX.pt, also write back to meta/episodes.jsonl
     enable_t5_fallback: true
-    t5_wan_path: "/share/home/bhz/pretrained_models"
+    t5_wan_path: "./pretrained_models"
     t5_folder_name: "t5_embedding"
     t5_text_len: 512
 
 # Model configuration（directly use ac_one default WAN/VLM paths）
 model:
   wan:
-    config_path: "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B"
-    checkpoint_path: "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B"
-    vae_path: "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    config_path: "./pretrained_models/Wan2.2-TI2V-5B"
+    checkpoint_path: "./pretrained_models/Wan2.2-TI2V-5B"
+    vae_path: "./pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
     precision: "bfloat16"
   vlm:
-    checkpoint_path: "/share/home/bhz/pretrained_models/Qwen3-VL-2B-Instruct"
+    checkpoint_path: "./pretrained_models/Qwen3-VL-2B-Instruct"
     precision: "bfloat16"
     frozen: true
   action_expert:
