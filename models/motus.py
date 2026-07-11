@@ -395,15 +395,15 @@ class UndModule(nn.Module):
         self,
         vlm_inputs
     ) -> torch.Tensor:
-        """Extract understanding features: frozen VLM forward + trainable adapter."""
+        """Extract understanding features: frozen VLM forward + adapter (adapter frozen in world-model mode)."""
         last_layer_features = self.extract_und_hidden(vlm_inputs)
         # [B, seq_len, vlm_dim] -> [B, seq_len, und_dim]
         return self.und_expert.vlm_adapter(last_layer_features)
 
     def und_features_from_hidden(self, vlm_hidden: torch.Tensor) -> torch.Tensor:
-        """Apply ONLY the trainable adapter to a precomputed frozen-VLM hidden state.
+        """Apply ONLY the adapter to a precomputed frozen-VLM hidden state.
         Used by the VLM-hidden cache path — the (frozen, expensive) VLM forward is
-        skipped and only the adapter (which is trained) runs here."""
+        skipped and only the adapter runs here (the adapter is frozen in world-model mode)."""
         return self.und_expert.vlm_adapter(vlm_hidden.to(self.device, self.dtype))
 
     def extract_und_hidden(
@@ -1194,9 +1194,8 @@ class Motus(nn.Module):
             via `VideoModule.process_joint_attention_wm`.
           - Loss = w_v · L_video + w_s · L_state. No L_action.
 
-        Action injection into WAN's video DiT is deferred to Phase 3 (additive injector);
-        for now WAN sees actions only through the state-stream joint attention, which is
-        enough to overfit one trajectory (sanity ladder step 2).
+        Actions are injected into WAN's video DiT directly via the additive ActionInjector
+        (below), in addition to the state-stream joint attention.
         """
         # 1. Video pipeline — identical to the VLA path. When precomputed VAE latents
         # are supplied (offline cache), skip the VAE forward entirely; the latents are

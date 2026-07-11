@@ -6,7 +6,7 @@
 # action-injection path).
 #
 # This is a pure-additive new module — it is only instantiated when the
-# world_model flag is on. Existing Motus pipelines do not import it.
+# world_model flag is on. Existing Motus pipelines import but never instantiate it.
 
 from dataclasses import dataclass
 from typing import Optional
