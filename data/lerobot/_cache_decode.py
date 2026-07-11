@@ -8,8 +8,7 @@ is brutally slow. Here we decode an entire episode's model-input frames ONCE
 (one sequential pass per camera) and let the builder slice per condition frame.
 
 Parity with __getitem__ is preserved by reusing the dataset's own
-`_resize_frame_chw` and replicating its stitch exactly (verified by
-scripts/verify_vae_cache.py, which compares against the untouched __getitem__).
+`_resize_frame_chw` and replicating its stitch exactly.
 """
 from __future__ import annotations
 

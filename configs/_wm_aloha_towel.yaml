@@ -15,8 +15,8 @@ dataset:
   image_aug: false
   params:
     repo_id: "lerobot/aloha_static_towel"   # full repo_id so lerobot version-check succeeds (needs HF_TOKEN)
-    root: "/home/ubuntu/Motus/data_lerobot/aloha_static_towel"
-    embodiment_type: "aloha_static_towel"  # per-joint min/max from THIS dataset (union of action+state, train split); built by data/utils/calc_lerobot_norm_stats.py
+    root: "./data_lerobot/aloha_static_towel"
+    embodiment_type: "aloha_static_towel"  # per-joint min/max from THIS dataset (union of action+state, train split)
     enable_t5_fallback: false          # using precomputed t5_embedding/
     t5_folder_name: "t5_embedding"
     t5_text_len: 512
@@ -35,7 +35,7 @@ dataset:
     vae_cache_folder: "vae_latent_cache"
     # ---- Offline VLM hidden-state cache ----
     # Build with: data/lerobot/build_vlm_cache_offline.py --config <this file>
-    # When present, the training step runs only the trainable VLM adapter and skips
+    # When present, the training step runs only the VLM adapter and skips
     # the frozen Qwen3-VL forward (~11% of step time). Missing keys fall back to a
     # live VLM forward, so this is safe to leave on before the cache is built.
     use_vlm_cache: true
@@ -43,13 +43,13 @@ dataset:
 
 model:
   wan:
-    config_path: "/home/ubuntu/Motus/pretrained_models/Wan2.2-TI2V-5B"
-    checkpoint_path: "/home/ubuntu/Motus/pretrained_models/Wan2.2-TI2V-5B"
-    vae_path: "/home/ubuntu/Motus/pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    config_path: "./pretrained_models/Wan2.2-TI2V-5B"
+    checkpoint_path: "./pretrained_models/Wan2.2-TI2V-5B"
+    vae_path: "./pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
     precision: "bfloat16"
     frozen: true                       # required for single-A100 fit
   vlm:
-    checkpoint_path: "/home/ubuntu/Motus/pretrained_models/Qwen3-VL-2B-Instruct"
+    checkpoint_path: "./pretrained_models/Qwen3-VL-2B-Instruct"
     precision: "bfloat16"
     frozen: true
   action_expert:
@@ -84,7 +84,7 @@ model:
   loss_term: focal_fm                  # 'fm' (default) | 'focal_fm' (residual-magnitude reweighted FM)
   # WM warm-start: seed StateExpert from a trained ActionExpert (RoboTwin2, 14-DoF bimanual).
   # Transfers blocks + time + registers + encoders 1:1; head left zero-init. Set null to disable.
-  warmup_action_expert_ckpt: "/home/ubuntu/Motus/pretrained_models/Motus_robotwin2/mp_rank_00_model_states.pt"
+  warmup_action_expert_ckpt: "./pretrained_models/Motus_robotwin2/mp_rank_00_model_states.pt"
 
 training:
   batch_size: 32
